@@ -64,13 +64,8 @@ class _GymRegistrationScreenState extends State<GymRegistrationScreen> {
       );
 
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Gym registered successfully! Please log in.'),
-            backgroundColor: Colors.green,
-          ),
-        );
-        context.go('/login');
+        final email = Uri.encodeQueryComponent(ownerEmailController.text.trim());
+        context.go('/otp-verify?email=$email');
       }
     } catch (e) {
       if (mounted) {

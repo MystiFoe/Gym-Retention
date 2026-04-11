@@ -251,6 +251,25 @@ CREATE INDEX idx_conversion_gym_id ON trial_conversion_log(gym_id);
 CREATE INDEX idx_conversion_status ON trial_conversion_log(conversion_status);
 
 -- ============================================================================
+-- OTP CODES TABLE
+-- Stores single-use 6-digit codes for email verification after registration
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS otp_codes (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  email VARCHAR(255) NOT NULL UNIQUE,
+  code VARCHAR(6) NOT NULL,
+  expires_at TIMESTAMP NOT NULL,
+  used_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_otp_codes_email ON otp_codes(email);
+CREATE INDEX idx_otp_codes_expires_at ON otp_codes(expires_at);
+
+-- email_verified column on users (true by default for existing rows)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true;
+
+-- ============================================================================
 -- VIEWS FOR ANALYTICS
 -- ============================================================================
 

@@ -207,6 +207,15 @@ const forgotPasswordSchema = z.object({
   email: z.string().email()
 });
 
+const sendOtpSchema = z.object({
+  email: z.string().email()
+});
+
+const verifyOtpSchema = z.object({
+  email: z.string().email(),
+  code: z.string().length(6).regex(/^\d{6}$/, 'OTP must be 6 digits')
+});
+
 const resetPasswordSchema = z.object({
   token: z.string().min(1),
   new_password: z.string().min(8).max(255).regex(
@@ -467,6 +476,27 @@ app.post('/api/gyms/register', validate(gymRegisterSchema), async (req: AuthRequ
       );
 
       await client.query('COMMIT');
+
+      // Auto-send OTP to verify owner email
+      const otpCode = String(Math.floor(100000 + Math.random() * 900000));
+      const otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
+      await pool.query(
+        `INSERT INTO otp_codes (email, code, expires_at) VALUES ($1, $2, $3)
+         ON CONFLICT (email) DO UPDATE SET code = $2, expires_at = $3, used_at = NULL`,
+        [owner_email, otpCode, otpExpiry]
+      );
+      await sendEmail(owner_email, 'Your Gym Retention verification code', `
+        <div style="font-family:sans-serif;max-width:480px;margin:auto">
+          <h2 style="color:#2196F3">Welcome to Gym Retention!</h2>
+          <p>Your gym <strong>${gym_name}</strong> has been registered. Verify your email with the code below.</p>
+          <div style="margin:28px 0;text-align:center">
+            <span style="display:inline-block;letter-spacing:10px;font-size:36px;font-weight:bold;color:#1a1a1a;background:#f4f6f8;padding:14px 24px;border-radius:10px;font-family:monospace">
+              ${otpCode}
+            </span>
+          </div>
+          <p style="color:#888;font-size:13px">This code expires in 10 minutes.</p>
+        </div>
+      `);
 
       res.status(201).json({
         success: true,
@@ -825,6 +855,116 @@ app.post('/api/auth/reset-password', async (req: Request, res: Response, next: N
 
       logger.info({ userId: resetToken.user_id }, 'Password reset successful');
       res.json({ success: true, message: 'Password updated successfully. You can now log in.' });
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ============================================================================
+// OTP ENDPOINTS
+// Send a 6-digit code to the owner's email after gym registration.
+// The code is valid for 10 minutes and single-use.
+// ============================================================================
+
+app.post('/api/auth/send-otp', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const parsed = sendOtpSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, error: 'Valid email is required' });
+    }
+    const { email } = parsed.data;
+
+    const client = await pool.connect();
+    try {
+      // Verify the email belongs to a gym owner
+      const userResult = await client.query(
+        `SELECT id FROM users WHERE phone_or_email = $1 AND role = 'owner' AND is_deleted = false LIMIT 1`,
+        [email]
+      );
+      if (userResult.rows.length === 0) {
+        // Return success anyway — prevent email enumeration
+        return res.json({ success: true, message: 'If that email exists, a code has been sent.' });
+      }
+
+      // Delete any existing OTPs for this email
+      await client.query(`DELETE FROM otp_codes WHERE email = $1`, [email]);
+
+      const code = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+      await client.query(
+        `INSERT INTO otp_codes (email, code, expires_at) VALUES ($1, $2, $3)`,
+        [email, code, expiresAt]
+      );
+
+      await sendEmail(email, 'Your Gym Retention verification code', `
+        <div style="font-family:sans-serif;max-width:480px;margin:auto">
+          <h2 style="color:#2196F3">Verify your email</h2>
+          <p>Use the code below to verify your email address. It expires in <strong>10 minutes</strong>.</p>
+          <div style="margin:28px 0;text-align:center">
+            <span style="display:inline-block;letter-spacing:10px;font-size:36px;font-weight:bold;color:#1a1a1a;background:#f4f6f8;padding:14px 24px;border-radius:10px;font-family:monospace">
+              ${code}
+            </span>
+          </div>
+          <p style="color:#888;font-size:13px">If you didn't create a Gym Retention account, you can ignore this email.</p>
+        </div>
+      `);
+
+      logger.info({ email }, 'OTP sent');
+      res.json({ success: true, message: 'Code sent to your email.' });
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/auth/verify-otp', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const parsed = verifyOtpSchema.safeParse(req.body);
+    if (!parsed.success) {
+      const msg = parsed.error.errors[0]?.message || 'Invalid input';
+      return res.status(400).json({ success: false, error: msg });
+    }
+    const { email, code } = parsed.data;
+
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        `SELECT id, expires_at, used_at FROM otp_codes WHERE email = $1 AND code = $2`,
+        [email, code]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(400).json({ success: false, error: 'Invalid code. Please check and try again.' });
+      }
+
+      const otp = result.rows[0];
+
+      if (otp.used_at) {
+        return res.status(400).json({ success: false, error: 'This code has already been used.' });
+      }
+
+      if (new Date() > new Date(otp.expires_at)) {
+        await client.query(`DELETE FROM otp_codes WHERE id = $1`, [otp.id]);
+        return res.status(400).json({ success: false, error: 'Code expired. Request a new one.' });
+      }
+
+      // Mark as used
+      await client.query(`UPDATE otp_codes SET used_at = NOW() WHERE id = $1`, [otp.id]);
+
+      // Mark the user's email as verified
+      await client.query(
+        `UPDATE users SET email_verified = true WHERE phone_or_email = $1 AND role = 'owner'`,
+        [email]
+      );
+
+      logger.info({ email }, 'OTP verified');
+      res.json({ success: true, message: 'Email verified successfully.' });
     } finally {
       client.release();
     }

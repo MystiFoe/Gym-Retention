@@ -16,6 +16,7 @@ import 'screens/trainer_dashboard_screen.dart';
 import 'screens/member_dashboard_screen.dart';
 import 'screens/trainers_screen.dart';
 import 'screens/admin_screen.dart';
+import 'screens/otp_screen.dart';
 import 'services/api_service.dart';
 
 // Notifies GoRouter when auth state changes so redirect re-evaluates
@@ -63,7 +64,7 @@ void main() async {
 }
 
 // Routes that do NOT require login
-const _publicRoutes = ['/login', '/register', '/forgot-password', '/reset-password', '/admin'];
+const _publicRoutes = ['/login', '/register', '/forgot-password', '/reset-password', '/admin', '/otp-verify'];
 
 final goRouterProvider = Provider((ref) {
   return GoRouter(
@@ -88,6 +89,12 @@ final goRouterProvider = Provider((ref) {
       GoRoute(
         path: '/register',
         builder: (context, state) => const GymRegistrationScreen(),
+      ),
+      GoRoute(
+        path: '/otp-verify',
+        builder: (context, state) => OtpScreen(
+          email: state.queryParameters['email'] ?? '',
+        ),
       ),
       GoRoute(
         path: '/forgot-password',

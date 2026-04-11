@@ -186,6 +186,30 @@ class ApiService {
     }
   }
 
+  Future<void> sendOtp({required String email}) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/auth/send-otp'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'email': email}),
+    );
+    if (response.statusCode >= 400) {
+      final body = jsonDecode(response.body);
+      throw ApiException(body['error'] ?? 'Failed to send OTP', response.statusCode);
+    }
+  }
+
+  Future<void> verifyOtp({required String email, required String code}) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/auth/verify-otp'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'email': email, 'code': code}),
+    );
+    if (response.statusCode >= 400) {
+      final body = jsonDecode(response.body);
+      throw ApiException(body['error'] ?? 'Invalid OTP', response.statusCode);
+    }
+  }
+
   // ============================================================================
   // GYM ENDPOINTS
   // ============================================================================
