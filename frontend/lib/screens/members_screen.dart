@@ -1,10 +1,8 @@
-// ignore: avoid_web_libraries_in_flutter
-import 'dart:html' as html;
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import '../services/api_service.dart';
 import '../models/models.dart';
+import '../utils/file_download.dart';
 
 // ============================================================================
 // GLOBAL STATUS COLOR HELPER — use this everywhere for consistency
@@ -318,12 +316,7 @@ class _MembersScreenState extends State<MembersScreen> {
     try {
       final bytes = await ApiService().exportMembersCsv();
       final filename = 'members_${DateTime.now().toIso8601String().split('T')[0]}.csv';
-      final blob = html.Blob([Uint8List.fromList(bytes)], 'text/csv');
-      final url = html.Url.createObjectUrlFromBlob(blob);
-      html.AnchorElement(href: url)
-        ..setAttribute('download', filename)
-        ..click();
-      html.Url.revokeObjectUrl(url);
+      await downloadFile(bytes, filename, 'text/csv');
     } catch (e) {
       if (mounted) messenger.showSnackBar(SnackBar(content: Text('Export failed: $e'), backgroundColor: Colors.red));
     }

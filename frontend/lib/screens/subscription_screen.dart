@@ -1,11 +1,10 @@
-// ignore: avoid_web_libraries_in_flutter
-import 'dart:js' as js;
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/api_service.dart';
 import '../models/models.dart';
 import '../utils/error_helper.dart';
+import '../utils/payment_launcher.dart';
 
 class SubscriptionScreen extends StatefulWidget {
   const SubscriptionScreen({super.key});
@@ -46,17 +45,14 @@ class _SubscriptionScreenState extends State<SubscriptionScreen> {
       final planId = plan.id;
       final messenger = ScaffoldMessenger.of(context);
 
-      // dart:js automatically wraps Dart functions passed to callMethod
-      js.context.callMethod('openRazorpayCheckout', [
-        js.JsObject.jsify({
-          'key_id': order.keyId,
-          'amount': order.amount,
-          'currency': order.currency,
-          'order_id': order.orderId,
-          'gym_name': order.gymName,
-          'plan_label': order.planLabel,
-        }),
-        (String paymentId, String orderId, String signature) async {
+      await launchRazorpay(
+        keyId: order.keyId,
+        amount: order.amount,
+        currency: order.currency,
+        orderId: order.orderId,
+        gymName: order.gymName,
+        planLabel: order.planLabel,
+        onSuccess: (paymentId, orderId, signature) async {
           try {
             await ApiService().verifyPayment(
               gymId: gymId,
@@ -84,7 +80,7 @@ class _SubscriptionScreenState extends State<SubscriptionScreen> {
             }
           }
         },
-        (String error) {
+        onFailure: (error) {
           if (mounted) {
             setState(() => _isProcessing = false);
             messenger.showSnackBar(SnackBar(
@@ -92,7 +88,7 @@ class _SubscriptionScreenState extends State<SubscriptionScreen> {
             ));
           }
         },
-      ]);
+      );
     } catch (e) {
       if (mounted) {
         setState(() => _isProcessing = false);
