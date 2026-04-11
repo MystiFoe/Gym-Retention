@@ -541,6 +541,69 @@ class ApiService {
   }
 
   // ============================================================================
+  // BULK IMPORT ENDPOINTS
+  // ============================================================================
+
+  /// Bulk import members. [members] is the list of validated row maps from
+  /// excel_parser.dart. Returns the raw `data` map from the API response:
+  /// { imported: int, skipped: int, errors: List, defaultPassword: String? }
+  Future<Map<String, dynamic>> bulkImportMembers({
+    required String trainerId,
+    required List<Map<String, String>> members,
+  }) async {
+    final payload = {
+      'trainer_id': trainerId,
+      'members': members.map((m) => {
+        'name': m['name'] ?? '',
+        'phone': m['phone'] ?? '',
+        'email': m['email'] ?? '',
+        'plan_fee': double.tryParse(m['plan_fee'] ?? '') ?? 0,
+        'membership_expiry_date': m['membership_expiry_date'] ?? '',
+        if ((m['last_visit_date'] ?? '').isNotEmpty)
+          'last_visit_date': m['last_visit_date'],
+      }).toList(),
+    };
+    final response = await http.post(
+      Uri.parse('$baseUrl/members/bulk-import'),
+      headers: _getHeaders(),
+      body: jsonEncode(payload),
+    );
+    if (response.statusCode == 401) throw UnauthorizedException('Session expired');
+    if (response.statusCode >= 400) {
+      final body = jsonDecode(response.body);
+      throw ApiException(body['error'] ?? 'Import failed', response.statusCode);
+    }
+    final body = jsonDecode(response.body);
+    return body['data'] as Map<String, dynamic>;
+  }
+
+  /// Bulk import trainers. Returns the raw `data` map:
+  /// { imported: int, skipped: int, errors: List, defaultPassword: String }
+  Future<Map<String, dynamic>> bulkImportTrainers({
+    required List<Map<String, String>> trainers,
+  }) async {
+    final payload = {
+      'trainers': trainers.map((t) => {
+        'name': t['name'] ?? '',
+        'phone': t['phone'] ?? '',
+        'email': t['email'] ?? '',
+      }).toList(),
+    };
+    final response = await http.post(
+      Uri.parse('$baseUrl/trainers/bulk-import'),
+      headers: _getHeaders(),
+      body: jsonEncode(payload),
+    );
+    if (response.statusCode == 401) throw UnauthorizedException('Session expired');
+    if (response.statusCode >= 400) {
+      final body = jsonDecode(response.body);
+      throw ApiException(body['error'] ?? 'Import failed', response.statusCode);
+    }
+    final body = jsonDecode(response.body);
+    return body['data'] as Map<String, dynamic>;
+  }
+
+  // ============================================================================
   // DATA EXPORT & GDPR ENDPOINTS
   // ============================================================================
 

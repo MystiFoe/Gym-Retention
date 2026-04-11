@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import '../services/api_service.dart';
 import '../models/models.dart';
+import 'bulk_import_dialog.dart';
 
 class TrainersScreen extends StatefulWidget {
   const TrainersScreen({super.key});
@@ -28,10 +29,26 @@ class _TrainersScreenState extends State<TrainersScreen> {
     });
   }
 
+  Future<void> _showImportDialog() async {
+    await showTrainersImportDialog(
+      context,
+      onSuccess: _reload,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Trainers')),
+      appBar: AppBar(
+        title: const Text('Trainers'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.upload_file_outlined),
+            tooltip: 'Import from Excel / CSV',
+            onPressed: _showImportDialog,
+          ),
+        ],
+      ),
       body: FutureBuilder<TrainersResponse>(
         future: trainersFuture,
         builder: (context, snapshot) {
@@ -194,6 +211,7 @@ class _TrainersScreenState extends State<TrainersScreen> {
               }
               final messenger = ScaffoldMessenger.of(context);
               final dialogMessenger = ScaffoldMessenger.of(ctx);
+              final nav = Navigator.of(ctx);
               try {
                 await ApiService().updateTrainer(
                   trainerId: trainer.id,
@@ -201,7 +219,7 @@ class _TrainersScreenState extends State<TrainersScreen> {
                   phone: phoneController.text,
                 );
                 if (mounted) {
-                  Navigator.pop(ctx);
+                  nav.pop();
                   _reload();
                   messenger.showSnackBar(
                       const SnackBar(content: Text('Trainer updated')));
@@ -341,6 +359,7 @@ class _TrainersScreenState extends State<TrainersScreen> {
             ElevatedButton(
               onPressed: () async {
                       final messenger = ScaffoldMessenger.of(context);
+                      final nav = Navigator.of(ctx);
                       final count = selectedMemberIds.length;
                       final trainerName = trainer.name;
                       try {
@@ -349,7 +368,7 @@ class _TrainersScreenState extends State<TrainersScreen> {
                           memberIds: selectedMemberIds.toList(),
                         );
                         if (mounted) {
-                          Navigator.pop(ctx);
+                          nav.pop();
                           _reload();
                           messenger.showSnackBar(
                             SnackBar(

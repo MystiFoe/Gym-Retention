@@ -267,6 +267,26 @@ const attendanceSchema = z.object({
   check_in_time: z.string().time().optional()
 });
 
+const bulkMembersSchema = z.object({
+  trainer_id: z.string().uuid(),
+  members: z.array(z.object({
+    name: z.string().min(2).max(100),
+    phone: z.string().min(10).max(20),
+    email: z.string().optional().nullable(),
+    plan_fee: z.number().positive(),
+    membership_expiry_date: z.string().min(1),
+    last_visit_date: z.string().optional().nullable(),
+  })).min(1).max(500),
+});
+
+const bulkTrainersSchema = z.object({
+  trainers: z.array(z.object({
+    name: z.string().min(2).max(100),
+    phone: z.string().min(10).max(20),
+    email: z.string().email(),
+  })).min(1).max(200),
+});
+
 // ============================================================================
 // EXPRESS APP
 // ============================================================================
@@ -968,6 +988,171 @@ app.post('/api/auth/verify-otp', async (req: Request, res: Response, next: NextF
     } finally {
       client.release();
     }
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ============================================================================
+// BULK IMPORT — MEMBERS
+// POST /api/members/bulk-import
+// Body: { trainer_id: uuid, members: [...] }
+// Returns: { imported, skipped, errors: [{row, name, error}] }
+// Max 500 rows per request. Processes best-effort (continues on row error).
+// ============================================================================
+
+app.post('/api/members/bulk-import', authenticate, authorize(['owner']), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const parsed = bulkMembersSchema.safeParse(req.body);
+    if (!parsed.success) {
+      const msg = parsed.error.errors[0]?.message || 'Invalid request body';
+      return res.status(400).json({ success: false, error: msg });
+    }
+    const { trainer_id, members } = parsed.data;
+
+    // Validate trainer belongs to this gym
+    const trainerCheck = await pool.query(
+      'SELECT id FROM trainers WHERE id = $1 AND gym_id = $2 AND is_deleted = false',
+      [trainer_id, req.gym_id]
+    );
+    if (trainerCheck.rows.length === 0) {
+      return res.status(400).json({ success: false, error: 'Trainer not found in this gym' });
+    }
+
+    let imported = 0;
+    const errors: { row: number; name: string; error: string }[] = [];
+
+    for (let i = 0; i < members.length; i++) {
+      const m = members[i];
+      const rowNum = i + 2; // 1-indexed + header row
+
+      try {
+        // Duplicate phone check
+        const phoneCheck = await pool.query(
+          'SELECT id FROM members WHERE gym_id = $1 AND phone = $2 AND is_deleted = false',
+          [req.gym_id, m.phone]
+        );
+        if (phoneCheck.rows.length > 0) {
+          errors.push({ row: rowNum, name: m.name, error: 'Phone already registered' });
+          continue;
+        }
+
+        const now = new Date();
+        const expiryDate = new Date(m.membership_expiry_date);
+        if (isNaN(expiryDate.getTime())) {
+          errors.push({ row: rowNum, name: m.name, error: 'Invalid expiry date format' });
+          continue;
+        }
+
+        const lastVisit = m.last_visit_date ? new Date(m.last_visit_date) : null;
+        const daysSinceVisit = lastVisit ? Math.floor((now.getTime() - lastVisit.getTime()) / 86400000) : 999;
+        const daysToExpiry = Math.floor((expiryDate.getTime() - now.getTime()) / 86400000);
+
+        let status = 'active';
+        if (daysToExpiry <= 7) status = 'high_risk';
+        else if (daysSinceVisit > 10) status = 'high_risk';
+        else if (daysSinceVisit > 5) status = 'at_risk';
+
+        const uniqueId = `GYM-${new Date().getFullYear()}-${Math.floor(Math.random() * 99999).toString().padStart(5, '0')}`;
+
+        await pool.query(
+          `INSERT INTO members (gym_id, name, phone, email, last_visit_date, membership_expiry_date, plan_fee, status, unique_id, assigned_trainer_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [req.gym_id, m.name, m.phone, m.email || '', m.last_visit_date || null, m.membership_expiry_date, m.plan_fee, status, uniqueId, trainer_id]
+        );
+
+        imported++;
+      } catch (err: any) {
+        const msg = err?.code === '23505' ? 'Duplicate entry' : (err?.message || 'Unknown error');
+        errors.push({ row: rowNum, name: m.name, error: msg });
+      }
+    }
+
+    // Refresh trainer member count
+    await pool.query(
+      `UPDATE trainers SET assigned_members_count = (
+         SELECT COUNT(*) FROM members WHERE assigned_trainer_id = $1 AND gym_id = $2 AND is_deleted = false
+       ) WHERE id = $1 AND gym_id = $2`,
+      [trainer_id, req.gym_id]
+    );
+
+    logger.info({ gymId: req.gym_id, imported, skipped: errors.length }, 'Bulk member import complete');
+    res.json({
+      success: true,
+      data: { imported, skipped: errors.length, errors },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ============================================================================
+// BULK IMPORT — TRAINERS
+// POST /api/trainers/bulk-import
+// Body: { trainers: [{name, phone, email}] }
+// Default password for all imported trainers: Gym@1234
+// Returns: { imported, skipped, errors, defaultPassword }
+// ============================================================================
+
+app.post('/api/trainers/bulk-import', authenticate, authorize(['owner']), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const parsed = bulkTrainersSchema.safeParse(req.body);
+    if (!parsed.success) {
+      const msg = parsed.error.errors[0]?.message || 'Invalid request body';
+      return res.status(400).json({ success: false, error: msg });
+    }
+    const { trainers } = parsed.data;
+    const DEFAULT_PASSWORD = 'Gym@1234';
+    const passwordHash = await bcrypt.hash(DEFAULT_PASSWORD, 10);
+
+    let imported = 0;
+    const errors: { row: number; name: string; error: string }[] = [];
+
+    for (let i = 0; i < trainers.length; i++) {
+      const t = trainers[i];
+      const rowNum = i + 2;
+
+      const client = await pool.connect();
+      try {
+        const existing = await client.query(
+          'SELECT id FROM users WHERE gym_id = $1 AND phone_or_email = $2 AND is_deleted = false',
+          [req.gym_id, t.email]
+        );
+        if (existing.rows.length > 0) {
+          errors.push({ row: rowNum, name: t.name, error: 'Email already registered' });
+          continue;
+        }
+
+        await client.query('BEGIN');
+
+        const userRes = await client.query(
+          `INSERT INTO users (gym_id, phone_or_email, password_hash, role)
+           VALUES ($1, $2, $3, 'trainer') RETURNING id`,
+          [req.gym_id, t.email, passwordHash]
+        );
+
+        await client.query(
+          `INSERT INTO trainers (gym_id, user_id, name, phone, email)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [req.gym_id, userRes.rows[0].id, t.name, t.phone, t.email]
+        );
+
+        await client.query('COMMIT');
+        imported++;
+      } catch (err: any) {
+        await client.query('ROLLBACK').catch(() => {});
+        const msg = err?.code === '23505' ? 'Duplicate entry' : (err?.message || 'Unknown error');
+        errors.push({ row: rowNum, name: t.name, error: msg });
+      } finally {
+        client.release();
+      }
+    }
+
+    logger.info({ gymId: req.gym_id, imported, skipped: errors.length }, 'Bulk trainer import complete');
+    res.json({
+      success: true,
+      data: { imported, skipped: errors.length, errors, defaultPassword: DEFAULT_PASSWORD },
+    });
   } catch (error) {
     next(error);
   }

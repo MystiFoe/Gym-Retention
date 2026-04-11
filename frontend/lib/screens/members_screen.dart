@@ -3,6 +3,7 @@ import 'package:go_router/go_router.dart';
 import '../services/api_service.dart';
 import '../models/models.dart';
 import '../utils/file_download.dart';
+import 'bulk_import_dialog.dart';
 
 // ============================================================================
 // GLOBAL STATUS COLOR HELPER — use this everywhere for consistency
@@ -49,6 +50,11 @@ class _MembersScreenState extends State<MembersScreen> {
       appBar: AppBar(
         title: const Text('Members'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.upload_file_outlined),
+            tooltip: 'Import from Excel / CSV',
+            onPressed: _showImportDialog,
+          ),
           IconButton(
             icon: const Icon(Icons.download),
             tooltip: 'Export CSV',
@@ -320,6 +326,29 @@ class _MembersScreenState extends State<MembersScreen> {
     } catch (e) {
       if (mounted) messenger.showSnackBar(SnackBar(content: Text('Export failed: $e'), backgroundColor: Colors.red));
     }
+  }
+
+  Future<void> _showImportDialog() async {
+    TrainersResponse? trainersResp;
+    try {
+      trainersResp = await trainersFuture;
+    } catch (_) {}
+
+    if (!mounted) return;
+
+    if (trainersResp == null || trainersResp.trainers.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Add at least one trainer before importing members.'),
+        backgroundColor: Colors.orange,
+      ));
+      return;
+    }
+
+    await showMembersImportDialog(
+      context,
+      trainers: trainersResp.trainers,
+      onSuccess: () => setState(_loadMembers),
+    );
   }
 
   void _confirmEraseData(BuildContext context, Member member) {

@@ -23,6 +23,8 @@ dependencies:
   web: ^1.0.0
   intl: ^0.19.0
   fl_chart: ^0.64.0
+  file_picker: ^6.1.1
+  excel: ^4.0.6
 
 dev_dependencies:
   flutter_test:
