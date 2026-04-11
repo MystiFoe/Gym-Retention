@@ -1,14 +1,25 @@
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../models/models.dart';
 
-const String BASE_URL = String.fromEnvironment(
-  'API_URL',
-  defaultValue: 'http://localhost:3000/api',
-);
+// In production pass --dart-define=API_URL=https://your-server.com/api
+// In dev on Android emulator: --dart-define=API_URL=http://10.0.2.2:3000/api
+// In dev on physical device:  --dart-define=API_URL=http://<your-pc-ip>:3000/api
+const String _envApiUrl = String.fromEnvironment('API_URL', defaultValue: '');
+
+String get baseUrl {
+  if (_envApiUrl.isNotEmpty) return _envApiUrl;
+  // Web and iOS simulator both resolve localhost fine
+  if (kIsWeb) return 'http://localhost:3000/api';
+  if (defaultTargetPlatform == TargetPlatform.android) {
+    return 'http://10.0.2.2:3000/api'; // Android emulator → host machine
+  }
+  return 'http://localhost:3000/api';
+}
 
 class ApiService {
   static final ApiService _instance = ApiService._internal();
@@ -94,7 +105,7 @@ class ApiService {
   Future<bool> _refreshAccessToken() async {
     try {
       final response = await http.post(
-        Uri.parse('$BASE_URL/auth/refresh'),
+        Uri.parse('$baseUrl/auth/refresh'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({'refresh_token': _refreshToken}),
       );
@@ -121,7 +132,7 @@ class ApiService {
     String? gymId,
   }) async {
     final response = await http.post(
-      Uri.parse('$BASE_URL/auth/login'),
+      Uri.parse('$baseUrl/auth/login'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({
         'phone_or_email': email,
@@ -153,7 +164,7 @@ class ApiService {
 
   Future<void> forgotPassword({required String email}) async {
     final response = await http.post(
-      Uri.parse('$BASE_URL/auth/forgot-password'),
+      Uri.parse('$baseUrl/auth/forgot-password'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({'email': email}),
     );
@@ -165,7 +176,7 @@ class ApiService {
 
   Future<void> resetPassword({required String token, required String newPassword}) async {
     final response = await http.post(
-      Uri.parse('$BASE_URL/auth/reset-password'),
+      Uri.parse('$baseUrl/auth/reset-password'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({'token': token, 'new_password': newPassword}),
     );
@@ -189,7 +200,7 @@ class ApiService {
     required String ownerEmail,
   }) async {
     final response = await http.post(
-      Uri.parse('$BASE_URL/gyms/register'),
+      Uri.parse('$baseUrl/gyms/register'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({
         'gym_name': gymName,
@@ -211,7 +222,7 @@ class ApiService {
 
   Future<GymSubscriptionResponse> getGymSubscription(String gymId) async {
     final response = await http.get(
-      Uri.parse('$BASE_URL/gyms/$gymId/subscription'),
+      Uri.parse('$baseUrl/gyms/$gymId/subscription'),
       headers: _getHeaders(),
     );
     return _handleResponse(response, (data) => GymSubscriptionResponse.fromJson(data));
@@ -222,7 +233,7 @@ class ApiService {
     required String plan,
   }) async {
     final response = await http.post(
-      Uri.parse('$BASE_URL/gyms/$gymId/billing/create-order'),
+      Uri.parse('$baseUrl/gyms/$gymId/billing/create-order'),
       headers: _getHeaders(),
       body: jsonEncode({'plan': plan}),
     );
@@ -237,7 +248,7 @@ class ApiService {
     required String plan,
   }) async {
     final response = await http.post(
-      Uri.parse('$BASE_URL/gyms/$gymId/billing/verify-payment'),
+      Uri.parse('$baseUrl/gyms/$gymId/billing/verify-payment'),
       headers: _getHeaders(),
       body: jsonEncode({
         'razorpay_order_id': razorpayOrderId,
@@ -263,7 +274,7 @@ class ApiService {
       'limit': limit.toString(),
       if (status != null) 'status': status,
     };
-    final uri = Uri.parse('$BASE_URL/members').replace(queryParameters: params);
+    final uri = Uri.parse('$baseUrl/members').replace(queryParameters: params);
     final response = await http.get(uri, headers: _getHeaders());
 
     return _handleResponse(response, (data) => MembersResponse.fromJson(data));
@@ -279,7 +290,7 @@ class ApiService {
     required String assignedTrainerId,
   }) async {
     final response = await http.post(
-      Uri.parse('$BASE_URL/members'),
+      Uri.parse('$baseUrl/members'),
       headers: _getHeaders(),
       body: jsonEncode({
         'name': name,
@@ -304,7 +315,7 @@ class ApiService {
     required double planFee,
   }) async {
     final response = await http.put(
-      Uri.parse('$BASE_URL/members/$memberId'),
+      Uri.parse('$baseUrl/members/$memberId'),
       headers: _getHeaders(),
       body: jsonEncode({
         'name': name,
@@ -320,7 +331,7 @@ class ApiService {
 
   Future<void> deleteMember(String memberId) async {
     final response = await http.delete(
-      Uri.parse('$BASE_URL/members/$memberId'),
+      Uri.parse('$baseUrl/members/$memberId'),
       headers: _getHeaders(),
     );
 
@@ -333,7 +344,7 @@ class ApiService {
 
   Future<TrainersResponse> getTrainers() async {
     final response = await http.get(
-      Uri.parse('$BASE_URL/trainers'),
+      Uri.parse('$baseUrl/trainers'),
       headers: _getHeaders(),
     );
     return _handleResponse(response, (data) => TrainersResponse.fromJson(data));
@@ -346,7 +357,7 @@ class ApiService {
     required String password,
   }) async {
     final response = await http.post(
-      Uri.parse('$BASE_URL/trainers'),
+      Uri.parse('$baseUrl/trainers'),
       headers: _getHeaders(),
       body: jsonEncode({
         'name': name,
@@ -361,7 +372,7 @@ class ApiService {
   Future<Trainer> getMyTrainerProfile() async {
     await loadTokens();
     final response = await http.get(
-      Uri.parse('$BASE_URL/trainers/me'),
+      Uri.parse('$baseUrl/trainers/me'),
       headers: _getHeaders(),
     );
     return _handleResponse(response, (data) => Trainer.fromJson(data));
@@ -373,7 +384,7 @@ class ApiService {
     required String phone,
   }) async {
     final response = await http.patch(
-      Uri.parse('$BASE_URL/trainers/$trainerId'),
+      Uri.parse('$baseUrl/trainers/$trainerId'),
       headers: _getHeaders(),
       body: jsonEncode({'name': name, 'phone': phone}),
     );
@@ -385,7 +396,7 @@ class ApiService {
     required List<String> memberIds,
   }) async {
     final response = await http.post(
-      Uri.parse('$BASE_URL/trainers/$trainerId/assign-members'),
+      Uri.parse('$baseUrl/trainers/$trainerId/assign-members'),
       headers: _getHeaders(),
       body: jsonEncode({'member_ids': memberIds}),
     );
@@ -394,7 +405,7 @@ class ApiService {
 
   Future<void> deleteTrainer(String trainerId) async {
     final response = await http.delete(
-      Uri.parse('$BASE_URL/trainers/$trainerId'),
+      Uri.parse('$baseUrl/trainers/$trainerId'),
       headers: _getHeaders(),
     );
     await _handleResponse(response, (_) => null);
@@ -411,7 +422,7 @@ class ApiService {
     String? notes,
   }) async {
     final response = await http.post(
-      Uri.parse('$BASE_URL/tasks'),
+      Uri.parse('$baseUrl/tasks'),
       headers: _getHeaders(),
       body: jsonEncode({
         'member_id': memberId,
@@ -429,7 +440,7 @@ class ApiService {
     if (status != null) params['status'] = status;
     if (trainerId != null) params['trainer_id'] = trainerId;
     if (memberId != null) params['member_id'] = memberId;
-    final uri = Uri.parse('$BASE_URL/tasks').replace(queryParameters: params.isEmpty ? null : params);
+    final uri = Uri.parse('$baseUrl/tasks').replace(queryParameters: params.isEmpty ? null : params);
 
     final response = await http.get(uri, headers: _getHeaders());
 
@@ -442,7 +453,7 @@ class ApiService {
     String? notes,
   }) async {
     final response = await http.patch(
-      Uri.parse('$BASE_URL/tasks/$taskId'),
+      Uri.parse('$baseUrl/tasks/$taskId'),
       headers: _getHeaders(),
       body: jsonEncode({
         'outcome': outcome,
@@ -463,7 +474,7 @@ class ApiService {
     String? checkInTime,
   }) async {
     final response = await http.post(
-      Uri.parse('$BASE_URL/attendance'),
+      Uri.parse('$baseUrl/attendance'),
       headers: _getHeaders(),
       body: jsonEncode({
         'member_id': memberId,
@@ -476,7 +487,7 @@ class ApiService {
   }
 
   Future<AttendanceResponse> getAttendance({String? date}) async {
-    final uri = Uri.parse('$BASE_URL/attendance').replace(
+    final uri = Uri.parse('$baseUrl/attendance').replace(
       queryParameters: date != null ? {'date': date} : null,
     );
     final response = await http.get(uri, headers: _getHeaders());
@@ -489,7 +500,7 @@ class ApiService {
 
   Future<DashboardKPIs> getDashboardKPIs() async {
     final response = await http.get(
-      Uri.parse('$BASE_URL/dashboard/kpis'),
+      Uri.parse('$baseUrl/dashboard/kpis'),
       headers: _getHeaders(),
     );
 
@@ -498,7 +509,7 @@ class ApiService {
 
   Future<RevenueResponse> getRevenue() async {
     final response = await http.get(
-      Uri.parse('$BASE_URL/revenue'),
+      Uri.parse('$baseUrl/revenue'),
       headers: _getHeaders(),
     );
 
@@ -512,7 +523,7 @@ class ApiService {
   /// Returns CSV bytes for all members. Caller should trigger a browser download.
   Future<List<int>> exportMembersCsv() async {
     final response = await http.get(
-      Uri.parse('$BASE_URL/members/export'),
+      Uri.parse('$baseUrl/members/export'),
       headers: _getHeaders(),
     );
     if (response.statusCode == 401) throw UnauthorizedException('Session expired');
@@ -525,7 +536,7 @@ class ApiService {
 
   Future<void> deleteMemberData(String memberId) async {
     final response = await http.delete(
-      Uri.parse('$BASE_URL/members/$memberId/data'),
+      Uri.parse('$baseUrl/members/$memberId/data'),
       headers: _getHeaders(),
     );
     if (response.statusCode == 401) throw UnauthorizedException('Session expired');
@@ -546,7 +557,7 @@ class ApiService {
 
   Future<List<AdminGym>> adminGetGyms(String secret) async {
     final response = await http.get(
-      Uri.parse('$BASE_URL/admin/gyms'),
+      Uri.parse('$baseUrl/admin/gyms'),
       headers: _adminHeaders(secret),
     );
     if (response.statusCode == 401) throw Exception('Invalid admin secret');
@@ -560,7 +571,7 @@ class ApiService {
 
   Future<void> adminSuspendGym(String secret, String gymId) async {
     final response = await http.post(
-      Uri.parse('$BASE_URL/admin/gyms/$gymId/suspend'),
+      Uri.parse('$baseUrl/admin/gyms/$gymId/suspend'),
       headers: _adminHeaders(secret),
     );
     if (response.statusCode == 401) throw Exception('Invalid admin secret');
@@ -572,7 +583,7 @@ class ApiService {
 
   Future<void> adminReactivateGym(String secret, String gymId) async {
     final response = await http.post(
-      Uri.parse('$BASE_URL/admin/gyms/$gymId/reactivate'),
+      Uri.parse('$baseUrl/admin/gyms/$gymId/reactivate'),
       headers: _adminHeaders(secret),
     );
     if (response.statusCode == 401) throw Exception('Invalid admin secret');
@@ -584,7 +595,7 @@ class ApiService {
 
   Future<void> adminConvertGym(String secret, String gymId, int months) async {
     final response = await http.post(
-      Uri.parse('$BASE_URL/admin/gyms/$gymId/convert'),
+      Uri.parse('$baseUrl/admin/gyms/$gymId/convert'),
       headers: _adminHeaders(secret),
       body: jsonEncode({'months': months}),
     );
