@@ -14,6 +14,8 @@ import prometheus from 'prom-client';
 import nodemailer from 'nodemailer';
 import crypto from 'crypto';
 import Razorpay from 'razorpay';
+import swaggerUi from 'swagger-ui-express';
+import swaggerSpec from './swagger';
 
 dotenv.config();
 
@@ -405,6 +407,15 @@ const errorHandler = (err: CustomError, req: Request, res: Response, next: NextF
     error: process.env.NODE_ENV === 'production' ? 'Error' : err.message
   });
 };
+
+// ============================================================================
+// SWAGGER API DOCS
+// ============================================================================
+
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
+  customSiteTitle: 'Gym Retention API Docs',
+  swaggerOptions: { persistAuthorization: true },
+}));
 
 // ============================================================================
 // HEALTH & METRICS
