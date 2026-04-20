@@ -11,7 +11,7 @@ services:
     environment:
       POSTGRES_DB: gym_retention
       POSTGRES_USER: gym_user
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_PASSWORD: gympass123
     ports:
       - "5432:5432"
     volumes:
@@ -32,7 +32,7 @@ services:
         max-file: "3"
 
   # ============================================================================
-  # Redis Cache (Optional)
+  # Redis Cache
   # ============================================================================
   redis:
     image: redis:7-alpine
@@ -65,22 +65,25 @@ services:
     container_name: gym_retention_api
     restart: always
     environment:
-      NODE_ENV: production
-      PORT: 3000
-      DATABASE_URL: postgresql://gym_user:${DB_PASSWORD}@postgres:5432/gym_retention
-      JWT_SECRET: ${JWT_SECRET}
-      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
-      CORS_ORIGIN: ${CORS_ORIGIN}
+      NODE_ENV: development
+      PORT: "3000"
+      DATABASE_URL: "postgresql://gym_user:gympass123@postgres:5432/gym_retention"
+      DATABASE_POOL_SIZE: "20"
+      JWT_SECRET: "b70c4ceea374df4fbe11f72d0b37e5427b86f49070a98077ae4502d39c35af69"
+      JWT_REFRESH_SECRET: "ffec29396540eb4b60e355e44e99ae507ff0adb3ae0ccf5e1c3cbd70e678ea1a"
+      CORS_ORIGIN: "http://localhost:3000"
       LOG_LEVEL: info
-      DATABASE_POOL_SIZE: 20
-      SMTP_HOST: ${SMTP_HOST}
-      SMTP_PORT: ${SMTP_PORT}
-      SMTP_USER: ${SMTP_USER}
-      SMTP_PASSWORD: ${SMTP_PASSWORD}
-      SMTP_FROM: ${SMTP_FROM}
-      REDIS_URL: redis://redis:6379
-      SENTRY_DSN: ${SENTRY_DSN}
-      ADMIN_SECRET: ${ADMIN_SECRET}
+      ADMIN_SECRET: "GymAdmin@Secret123456789012345678"
+      RAZORPAY_KEY_ID: "rzp_test_dummy123456789"
+      RAZORPAY_KEY_SECRET: "dummysecret123456789"
+      SMTP_HOST: "smtp.gmail.com"
+      SMTP_PORT: "587"
+      SMTP_SECURE: "false"
+      SMTP_USER: "test@gmail.com"
+      SMTP_PASSWORD: "testpassword"
+      SMTP_FROM: "noreply@gymretention.com"
+      SENTRY_DSN: "disabled"
+      REDIS_URL: "redis://redis:6379"
     ports:
       - "3000:3000"
     depends_on:
@@ -128,24 +131,19 @@ services:
         max-file: "3"
 
   # ============================================================================
-  # Database Backup Service — dumps daily, uploads to S3, keeps 30 days local
-  # Required env vars: DB_PASSWORD, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
-  #                    AWS_DEFAULT_REGION, BACKUP_S3_BUCKET
-  # Optional: BACKUP_S3_PREFIX (default: gym-retention/backups)
-  # To use Google Cloud Storage instead of S3, set BACKUP_S3_BUCKET to your
-  # GCS bucket name and configure a GCS HMAC key as the AWS credentials.
+  # Database Backup Service
   # ============================================================================
   backup:
     image: amazon/aws-cli:latest
     container_name: gym_retention_backup
     restart: always
     environment:
-      PGPASSWORD: ${DB_PASSWORD}
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-south-1}
-      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET}
-      BACKUP_S3_PREFIX: ${BACKUP_S3_PREFIX:-gym-retention/backups}
+      PGPASSWORD: gympass123
+      AWS_ACCESS_KEY_ID: "dummy"
+      AWS_SECRET_ACCESS_KEY: "dummy"
+      AWS_DEFAULT_REGION: ap-south-1
+      BACKUP_S3_BUCKET: "dummy-bucket"
+      BACKUP_S3_PREFIX: gym-retention/backups
     depends_on:
       - postgres
     volumes:
@@ -169,7 +167,7 @@ services:
         max-file: "3"
 
   # ============================================================================
-  # Prometheus Monitoring (Optional)
+  # Prometheus Monitoring
   # ============================================================================
   prometheus:
     image: prom/prometheus:latest
@@ -194,7 +192,7 @@ services:
         max-file: "3"
 
   # ============================================================================
-  # Grafana Dashboards (Optional)
+  # Grafana Dashboards
   # ============================================================================
   grafana:
     image: grafana/grafana:latest

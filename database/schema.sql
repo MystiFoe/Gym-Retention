@@ -366,5 +366,37 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO gym_user;
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO gym_user;
 
 -- ============================================================================
+-- PHONE COLUMN ON USERS (for phone-based login & Firebase OTP)
+-- Stores the verified E.164 phone number set during registration.
+-- ============================================================================
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(20);
+CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
+
+-- ============================================================================
+-- PENDING REGISTRATIONS TABLE
+-- Holds unverified registration data until both email AND phone are confirmed.
+-- Rows are deleted on successful completion or when expires_at is reached.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS pending_registrations (
+  id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  gym_name        VARCHAR(255) NOT NULL,
+  owner_name      VARCHAR(255) NOT NULL,
+  gym_phone       VARCHAR(20)  NOT NULL,
+  gym_email       VARCHAR(255) NOT NULL,
+  address         TEXT,
+  owner_email     VARCHAR(255) NOT NULL,
+  password_hash   VARCHAR(255) NOT NULL,
+  email_otp_code      VARCHAR(6),
+  email_otp_expires_at TIMESTAMP,
+  email_verified  BOOLEAN  DEFAULT FALSE,
+  expires_at      TIMESTAMP NOT NULL,
+  created_at      TIMESTAMP DEFAULT NOW(),
+  UNIQUE(owner_email)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_reg_owner_email ON pending_registrations(owner_email);
+CREATE INDEX IF NOT EXISTS idx_pending_reg_expires_at  ON pending_registrations(expires_at);
+
+-- ============================================================================
 -- END OF SCHEMA
 -- ============================================================================
