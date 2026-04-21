@@ -3051,6 +3051,28 @@ app.post('/api/admin/gyms/:id/convert', adminAuth, validate(convertGymSchema), a
   }
 });
 
+// DELETE /api/admin/gyms/:id — permanently delete a gym and all its data
+app.delete('/api/admin/gyms/:id', adminAuth, async (req: Request, res: Response) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const gymRes = await client.query(`SELECT name FROM gyms WHERE id = $1`, [id]);
+    if (gymRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Gym not found' });
+    }
+    const gymName = gymRes.rows[0].name;
+    // CASCADE is set on all child tables so deleting from gyms removes everything
+    await client.query(`DELETE FROM gyms WHERE id = $1`, [id]);
+    logger.info({ gymId: id, gymName }, 'Admin: gym permanently deleted');
+    res.json({ success: true, data: { message: `"${gymName}" and all its data have been permanently deleted` } });
+  } catch (err: any) {
+    logger.error(err, 'Admin delete gym failed');
+    res.status(500).json({ success: false, error: 'Failed to delete gym' });
+  } finally {
+    client.release();
+  }
+});
+
 // ============================================================================
 // MIDDLEWARE & ERROR HANDLING
 // ============================================================================
