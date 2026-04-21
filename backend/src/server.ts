@@ -3085,26 +3085,31 @@ app.use((req: Request, res: Response) => {
 });
 
 // ============================================================================
-// SERVER START
+// SERVER START (local only — Firebase Functions handles this in production)
 // ============================================================================
 
-const PORT = parseInt(process.env.PORT || '3000');
+// K_SERVICE is set by Google Cloud Run / Firebase Functions environment.
+// FUNCTION_TARGET is set by the Firebase Functions emulator.
+// If neither is set, we're running locally and should start the HTTP server.
+if (!process.env.K_SERVICE && !process.env.FUNCTION_TARGET) {
+  const PORT = parseInt(process.env.PORT || '3000');
 
-const server = app.listen(PORT, () => {
-  logger.info(`Server running on port ${PORT}`);
-  logger.info(`Health: http://localhost:${PORT}/health`);
-  logger.info(`Metrics: http://localhost:${PORT}/metrics`);
-});
+  const server = app.listen(PORT, () => {
+    logger.info(`Server running on port ${PORT}`);
+    logger.info(`Health: http://localhost:${PORT}/health`);
+    logger.info(`Metrics: http://localhost:${PORT}/metrics`);
+  });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  logger.info('SIGTERM received');
-  server.close(() => {
-    pool.end(() => {
-      logger.info('Server closed gracefully');
-      process.exit(0);
+  // Graceful shutdown
+  process.on('SIGTERM', () => {
+    logger.info('SIGTERM received');
+    server.close(() => {
+      pool.end(() => {
+        logger.info('Server closed gracefully');
+        process.exit(0);
+      });
     });
   });
-});
+}
 
 export default app;

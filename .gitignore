@@ -10,3 +10,6 @@ dist/
 coverage/
 .nyc_output/
 build/
+# Flutter web build output (generated — run deploy.sh to rebuild)
+public/
+!public/.gitkeep
