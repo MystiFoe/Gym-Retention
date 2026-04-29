@@ -372,6 +372,12 @@ GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO gym_user;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(20);
 CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
 
+-- phone_verified: true once the user has completed Firebase Phone OTP verification
+-- Owners verified during registration; staff start as false (unverified) until they verify.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified BOOLEAN NOT NULL DEFAULT false;
+-- Existing owners who completed registration already verified their phone
+UPDATE users SET phone_verified = true WHERE role = 'owner' AND phone IS NOT NULL AND phone != '';
+
 -- ============================================================================
 -- PENDING REGISTRATIONS TABLE
 -- Holds unverified registration data until both email AND phone are confirmed.

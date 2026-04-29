@@ -35,6 +35,7 @@ if (process.env.SENTRY_DSN) {
 
 // ============================================================================
 // STARTUP ENV VALIDATION — crash fast if required vars are missing
+// Skip during Firebase CLI analysis phase (module is imported, not executed).
 // ============================================================================
 const REQUIRED_ENV_VARS = [
   'DATABASE_URL',
@@ -42,19 +43,26 @@ const REQUIRED_ENV_VARS = [
   'JWT_REFRESH_SECRET',
   'CORS_ORIGIN',
 ];
-for (const envVar of REQUIRED_ENV_VARS) {
-  if (!process.env[envVar]) {
-    console.error(`FATAL: Missing required environment variable: ${envVar}`);
+
+// Only validate when: running as the main script (local dev) OR inside Cloud Run
+// (K_SERVICE is set). During Firebase CLI analysis, neither is true, so we skip.
+const _isMainScript = require.main === module;
+const _isCloudRun = !!(process.env.K_SERVICE || process.env.FUNCTION_TARGET);
+if (_isMainScript || _isCloudRun) {
+  for (const envVar of REQUIRED_ENV_VARS) {
+    if (!process.env[envVar]) {
+      console.error(`FATAL: Missing required environment variable: ${envVar}`);
+      process.exit(1);
+    }
+  }
+  if ((process.env.JWT_SECRET || '').length < 32) {
+    console.error('FATAL: JWT_SECRET must be at least 32 characters');
     process.exit(1);
   }
-}
-if (process.env.JWT_SECRET!.length < 32) {
-  console.error('FATAL: JWT_SECRET must be at least 32 characters');
-  process.exit(1);
-}
-if (process.env.JWT_REFRESH_SECRET!.length < 32) {
-  console.error('FATAL: JWT_REFRESH_SECRET must be at least 32 characters');
-  process.exit(1);
+  if ((process.env.JWT_REFRESH_SECRET || '').length < 32) {
+    console.error('FATAL: JWT_REFRESH_SECRET must be at least 32 characters');
+    process.exit(1);
+  }
 }
 
 // ============================================================================
@@ -82,8 +90,13 @@ const PLANS: Record<string, { label: string; amount: number; months: number }> =
 let firebaseInitialized = false;
 try {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    // Explicit service account JSON (local dev / non-Firebase deployments)
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    firebaseInitialized = true;
+  } else if (process.env.K_SERVICE || process.env.FUNCTION_TARGET) {
+    // Running inside Firebase Functions — use Application Default Credentials
+    admin.initializeApp();
     firebaseInitialized = true;
   }
 } catch (err) {
@@ -166,43 +179,88 @@ pool.on('error', (err) => {
   logger.error({ error: err }, 'Database pool error');
 });
 
+// Add fcm_token column if it doesn't exist (idempotent migration)
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT`).catch(() => {});
+// Fix column sizes that may have been created too small in earlier schema versions
+pool.query(`ALTER TABLE members ALTER COLUMN email TYPE VARCHAR(255)`).catch(() => {});
+pool.query(`ALTER TABLE members ALTER COLUMN phone TYPE VARCHAR(30)`).catch(() => {});
+pool.query(`ALTER TABLE members ALTER COLUMN name  TYPE VARCHAR(255)`).catch(() => {});
+pool.query(`ALTER TABLE trainers ALTER COLUMN email TYPE VARCHAR(255)`).catch(() => {});
+pool.query(`ALTER TABLE trainers ALTER COLUMN phone TYPE VARCHAR(30)`).catch(() => {});
+pool.query(`ALTER TABLE trainers ALTER COLUMN name  TYPE VARCHAR(255)`).catch(() => {});
+// NOTE: is_blocked, blocked_at, blocked_reason columns on gyms must be added
+// by running database/migration_gym_block.sql in the Supabase SQL editor.
+// DDL via the transaction pooler (port 6543) is not supported.
+
 // ============================================================================
 // EMAIL SERVICE
 // ============================================================================
 
-const smtpConfigured = !!(process.env.SMTP_USER && process.env.SMTP_PASSWORD);
+// ============================================================================
+// FCM PUSH NOTIFICATION HELPER
+// Sends a push notification to a single FCM token.
+// Silently skips if Firebase is not initialized or token is empty.
+// ============================================================================
 
-if (!smtpConfigured) {
-  console.warn('WARNING: SMTP_USER or SMTP_PASSWORD not set — emails will be skipped. Set them in .env to enable email notifications.');
-}
+const sendPush = async (
+  fcmToken: string | null | undefined,
+  title: string,
+  body: string,
+  data: Record<string, string> = {}
+): Promise<void> => {
+  if (!firebaseInitialized || !fcmToken) return;
+  try {
+    await admin.messaging().send({
+      token: fcmToken,
+      notification: { title, body },
+      data,
+      android: { priority: 'high' },
+      apns: { payload: { aps: { sound: 'default' } } },
+    });
+    logger.info({ title }, 'Push notification sent');
+  } catch (err: any) {
+    // Token invalid/unregistered — clear it from DB
+    if (err?.errorInfo?.code === 'messaging/registration-token-not-registered') {
+      await pool.query(`UPDATE users SET fcm_token = NULL WHERE fcm_token = $1`, [fcmToken]).catch(() => {});
+    }
+    logger.warn({ err: err?.message, title }, 'Push notification failed');
+  }
+};
 
-const emailTransporter = smtpConfigured
-  ? nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: parseInt(process.env.SMTP_PORT || '587'),
-      secure: process.env.SMTP_SECURE === 'true',
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASSWORD,
-      },
-    })
-  : null;
+// ── SMTP transporter (Gmail or any SMTP relay) ──────────────────────────────
+// Configure via Firebase Secrets: SMTP_USER, SMTP_PASSWORD, SMTP_FROM, SMTP_HOST
+let _smtpTransporter: nodemailer.Transporter | null = null;
+const getSmtpTransporter = (): nodemailer.Transporter | null => {
+  if (_smtpTransporter) return _smtpTransporter;
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASSWORD;
+  const host = process.env.SMTP_HOST || 'smtp.gmail.com';
+  if (!user || !pass) {
+    logger.warn('SMTP not configured — SMTP_USER / SMTP_PASSWORD missing');
+    return null;
+  }
+  _smtpTransporter = nodemailer.createTransport({
+    host,
+    port: 587,
+    secure: false,
+    auth: { user, pass },
+  });
+  return _smtpTransporter;
+};
 
-const sendEmail = async (to: string, subject: string, html: string) => {
-  if (!emailTransporter) {
-    logger.warn({ to, subject }, 'Email skipped — SMTP not configured');
+const sendEmail = async (to: string, subject: string, html: string): Promise<void> => {
+  const transport = getSmtpTransporter();
+  if (!transport) {
+    logger.warn({ to, subject }, 'Email not sent — SMTP not configured');
     return;
   }
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
   try {
-    await emailTransporter.sendMail({
-      from: process.env.SMTP_FROM,
-      to,
-      subject,
-      html
-    });
+    await transport.sendMail({ from, to, subject, html });
     logger.info({ to, subject }, 'Email sent');
-  } catch (error) {
-    logger.error({ error, to }, 'Email send failed');
+  } catch (err: any) {
+    logger.error({ err: err?.message, to }, 'Email send failed');
+    throw new Error('Failed to send email. Please check your inbox or try again.');
   }
 };
 
@@ -324,7 +382,7 @@ const app: Express = express();
 
 app.use(helmet());
 app.use(cors({
-  origin: process.env.CORS_ORIGIN!.split(',').map(o => o.trim()),
+  origin: (process.env.CORS_ORIGIN || '*').split(',').map(o => o.trim()),
   credentials: true
 }));
 
@@ -428,6 +486,24 @@ const authenticate = async (req: AuthRequest, res: Response, next: NextFunction)
     if (!decoded.gym_id) {
       return res.status(401).json({ success: false, error: 'Invalid token' });
     }
+
+    // Immediately reject if gym is blocked (takes effect even with a valid JWT)
+    try {
+      const gymCheck = await pool.query(
+        `SELECT is_blocked FROM gyms WHERE id = $1 AND is_deleted = false LIMIT 1`,
+        [decoded.gym_id]
+      );
+      if (!gymCheck.rows.length) {
+        return res.status(403).json({ success: false, error: 'Gym not found or deleted.' });
+      }
+      if (gymCheck.rows[0].is_blocked) {
+        return res.status(403).json({ success: false, error: 'Your account has been blocked. Please contact support.' });
+      }
+    } catch (dbErr: any) {
+      // If is_blocked column doesn't exist yet (migration not run), skip the check gracefully
+      if (!dbErr?.message?.includes('is_blocked')) throw dbErr;
+    }
+
     req.user = decoded;
     req.gym_id = decoded.gym_id;
     next();
@@ -460,9 +536,37 @@ const errorHandler = (err: CustomError, req: Request, res: Response, next: NextF
     Sentry.captureException(err, { extra: { path: req.path, method: req.method } });
   }
 
+  // Map known DB error codes to user-friendly messages
+  let userMessage = err.message;
+  const dbCode: string = (err as any).code || '';
+  if (dbCode === '23505') {
+    const combined = [
+      (err as any).detail || '',
+      (err as any).constraint || '',
+      err.message || '',
+    ].join(' ').toLowerCase();
+    if (combined.includes('phone')) userMessage = 'This phone number is already registered.';
+    else if (combined.includes('email')) userMessage = 'This email address is already registered.';
+    else if (combined.includes('unique_id')) userMessage = 'Please try again.';
+    else userMessage = 'A duplicate entry was detected. Please check your details.';
+  } else if (dbCode === '22001' || err.message?.includes('value too long for type character varying')) {
+    userMessage = 'One or more fields exceed the allowed length. Please shorten your input.';
+  } else if (dbCode === '23502') {
+    userMessage = 'A required field is missing. Please fill in all required fields.';
+  } else if (dbCode === '23503') {
+    userMessage = 'The related record was not found. Please refresh and try again.';
+  } else if (dbCode === '08006' || dbCode === '08001' || dbCode === '08004') {
+    userMessage = 'Database connection issue. Please try again in a moment.';
+  } else if (dbCode.startsWith('22') || dbCode.startsWith('23')) {
+    // Any other data exception or integrity constraint — don't leak raw message
+    userMessage = 'Invalid data provided. Please check your input and try again.';
+  } else if (dbCode && !userMessage) {
+    userMessage = 'An unexpected error occurred. Please try again.';
+  }
+
   res.status(status).json({
     success: false,
-    error: process.env.NODE_ENV === 'production' ? 'Error' : err.message
+    error: userMessage || 'An unexpected error occurred. Please try again.',
   });
 };
 
@@ -471,7 +575,7 @@ const errorHandler = (err: CustomError, req: Request, res: Response, next: NextF
 // ============================================================================
 
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
-  customSiteTitle: 'Gym Retention API Docs',
+  customSiteTitle: 'Recurva API Docs',
   swaggerOptions: { persistAuthorization: true },
 }));
 
@@ -511,7 +615,7 @@ app.post('/api/gyms/register', validate(gymRegisterSchema), async (req: AuthRequ
       [email]
     );
     if (gymEmailCheck.rows.length > 0) {
-      return res.status(409).json({ success: false, error: 'A gym with this email already exists.' });
+      return res.status(409).json({ success: false, error: 'An account with this email already exists.' });
     }
 
     // Reject if owner login email already registered
@@ -524,9 +628,11 @@ app.post('/api/gyms/register', validate(gymRegisterSchema), async (req: AuthRequ
     }
 
     const passwordHash = await bcrypt.hash(owner_password, 10);
-    const otpCode     = String(Math.floor(100000 + Math.random() * 900000));
-    const otpExpiry   = new Date(Date.now() + 10 * 60 * 1000);  // 10 min
-    const sessionExpiry = new Date(Date.now() + 30 * 60 * 1000); // 30 min to complete
+    const sessionExpiry = new Date(Date.now() + 60 * 60 * 1000); // 60 min to complete
+
+    // Generate 6-digit OTP
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const otpExpiry = new Date(Date.now() + 15 * 60 * 1000); // 15 min
 
     // Upsert pending registration (allow retry with same email)
     const pendingRes = await pool.query(
@@ -547,26 +653,29 @@ app.post('/api/gyms/register', validate(gymRegisterSchema), async (req: AuthRequ
          expires_at = EXCLUDED.expires_at,
          created_at = NOW()
        RETURNING id`,
-      [gym_name, owner_name, phone, email, address, owner_email,
-       passwordHash, otpCode, otpExpiry, sessionExpiry]
+      [gym_name, owner_name, phone, email, address, owner_email, passwordHash, otp, otpExpiry, sessionExpiry]
     );
 
     const pendingId = pendingRes.rows[0].id;
 
-    await sendEmail(owner_email, 'Verify your email – Gym Retention', `
-      <div style="font-family:sans-serif;max-width:480px;margin:auto">
-        <h2 style="color:#2196F3">Verify your email address</h2>
-        <p>You're almost done! Enter the code below to verify your email and continue setting up <strong>${gym_name}</strong>.</p>
-        <div style="margin:28px 0;text-align:center">
-          <span style="display:inline-block;letter-spacing:10px;font-size:36px;font-weight:bold;color:#1a1a1a;background:#f4f6f8;padding:14px 24px;border-radius:10px;font-family:monospace">
-            ${otpCode}
-          </span>
+    // Send OTP email
+    await sendEmail(
+      owner_email,
+      'Your Recurva Verification Code',
+      `
+      <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:32px;background:#f9f9f9;border-radius:12px">
+        <h2 style="color:#2196F3;margin-bottom:8px">Verify Your Email</h2>
+        <p style="color:#444;margin-bottom:24px">Use the code below to verify your email and complete your <strong>Recurva</strong> business registration.</p>
+        <div style="background:#fff;border:2px solid #2196F3;border-radius:10px;padding:20px;text-align:center;margin-bottom:24px">
+          <span style="font-size:42px;font-weight:bold;letter-spacing:14px;color:#1a1a1a;font-family:monospace">${otp}</span>
         </div>
-        <p style="color:#888;font-size:13px">This code expires in 10 minutes. If you didn't request this, ignore this email.</p>
+        <p style="color:#888;font-size:13px">This code expires in <strong>15 minutes</strong>. Do not share it with anyone.</p>
+        <p style="color:#888;font-size:13px">If you didn't request this, please ignore this email.</p>
       </div>
-    `);
+      `
+    );
 
-    logger.info({ owner_email, pendingId }, 'Registration initiated — email OTP sent');
+    logger.info({ owner_email, pendingId }, 'Registration initiated — OTP sent via email');
 
     res.status(200).json({
       success: true,
@@ -578,19 +687,17 @@ app.post('/api/gyms/register', validate(gymRegisterSchema), async (req: AuthRequ
 });
 
 // ============================================================================
-// STEP 2 — Verify email OTP for the pending registration.
+// STEP 2 — Verify 6-digit email OTP for the pending registration.
 // ============================================================================
 app.post('/api/gyms/register/verify-email', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const parsed = verifyRegistrationEmailSchema.safeParse(req.body);
-    if (!parsed.success) {
-      const msg = parsed.error.errors[0]?.message || 'Invalid input';
-      return res.status(400).json({ success: false, error: msg });
+    const { pending_id, otp_code } = req.body;
+    if (!pending_id || !otp_code) {
+      return res.status(400).json({ success: false, error: 'pending_id and otp_code are required' });
     }
-    const { pending_id, code } = parsed.data;
 
     const result = await pool.query(
-      `SELECT id, gym_phone, email_otp_code, email_otp_expires_at, email_verified, expires_at
+      `SELECT id, gym_phone, owner_email, email_verified, email_otp_code, email_otp_expires_at, expires_at
        FROM pending_registrations WHERE id = $1`,
       [pending_id]
     );
@@ -606,17 +713,23 @@ app.post('/api/gyms/register/verify-email', async (req: Request, res: Response, 
       return res.status(400).json({ success: false, error: 'Registration session expired. Please start the registration again.' });
     }
 
-    // Idempotent — if already verified, just return success
+    // Idempotent — if already verified, proceed to phone step
     if (pending.email_verified) {
       return res.json({ success: true, data: { pendingId: pending_id, gymPhone: pending.gym_phone } });
     }
 
-    if (pending.email_otp_code !== code) {
-      return res.status(400).json({ success: false, error: 'Incorrect code. Please check your email and try again.' });
+    // Check OTP expiry
+    if (new Date() > new Date(pending.email_otp_expires_at)) {
+      return res.status(400).json({ success: false, error: 'Verification code expired. Please request a new one.' });
     }
 
-    if (new Date() > new Date(pending.email_otp_expires_at)) {
-      return res.status(400).json({ success: false, error: 'Code expired. Please request a new one.' });
+    // Check OTP match (constant-time compare to prevent timing attacks)
+    const otpMatch = crypto.timingSafeEqual(
+      Buffer.from(String(otp_code).trim()),
+      Buffer.from(String(pending.email_otp_code))
+    );
+    if (!otpMatch) {
+      return res.status(400).json({ success: false, error: 'Incorrect verification code. Please try again.' });
     }
 
     await pool.query(
@@ -624,7 +737,7 @@ app.post('/api/gyms/register/verify-email', async (req: Request, res: Response, 
       [pending_id]
     );
 
-    logger.info({ pending_id }, 'Registration email OTP verified');
+    logger.info({ pending_id }, 'Registration email verified via OTP');
     res.json({ success: true, data: { pendingId: pending_id, gymPhone: pending.gym_phone } });
   } catch (error) {
     next(error);
@@ -632,58 +745,50 @@ app.post('/api/gyms/register/verify-email', async (req: Request, res: Response, 
 });
 
 // ============================================================================
-// STEP 2b — Resend email OTP (if user didn't receive it or it expired).
+// STEP 2b — Resend email OTP.
 // ============================================================================
 app.post('/api/gyms/register/resend-email-otp', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { pending_id } = req.body;
-    if (!pending_id) {
-      return res.status(400).json({ success: false, error: 'pending_id is required' });
-    }
+    if (!pending_id) return res.status(400).json({ success: false, error: 'pending_id is required' });
 
     const result = await pool.query(
-      `SELECT id, owner_email, gym_name, email_verified, expires_at
-       FROM pending_registrations WHERE id = $1`,
+      `SELECT id, owner_email, expires_at FROM pending_registrations WHERE id = $1`,
       [pending_id]
     );
-
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, error: 'Registration session not found.' });
     }
-
     const pending = result.rows[0];
-
     if (new Date() > new Date(pending.expires_at)) {
-      return res.status(400).json({ success: false, error: 'Registration session expired. Please start over.' });
+      return res.status(400).json({ success: false, error: 'Session expired. Please start registration again.' });
     }
 
-    if (pending.email_verified) {
-      return res.status(400).json({ success: false, error: 'Email is already verified.' });
-    }
-
-    const newCode    = String(Math.floor(100000 + Math.random() * 900000));
-    const newExpiry  = new Date(Date.now() + 10 * 60 * 1000);
-
+    // Generate new OTP
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const otpExpiry = new Date(Date.now() + 15 * 60 * 1000);
     await pool.query(
       `UPDATE pending_registrations SET email_otp_code = $1, email_otp_expires_at = $2 WHERE id = $3`,
-      [newCode, newExpiry, pending_id]
+      [otp, otpExpiry, pending_id]
     );
 
-    await sendEmail(pending.owner_email, 'New verification code – Gym Retention', `
-      <div style="font-family:sans-serif;max-width:480px;margin:auto">
-        <h2 style="color:#2196F3">New verification code</h2>
-        <p>Here is your new email verification code for <strong>${pending.gym_name}</strong>.</p>
-        <div style="margin:28px 0;text-align:center">
-          <span style="display:inline-block;letter-spacing:10px;font-size:36px;font-weight:bold;color:#1a1a1a;background:#f4f6f8;padding:14px 24px;border-radius:10px;font-family:monospace">
-            ${newCode}
-          </span>
+    await sendEmail(
+      pending.owner_email,
+      'Your Recurva Verification Code (Resent)',
+      `
+      <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:32px;background:#f9f9f9;border-radius:12px">
+        <h2 style="color:#2196F3;margin-bottom:8px">New Verification Code</h2>
+        <p style="color:#444;margin-bottom:24px">Here is your new <strong>Recurva</strong> verification code:</p>
+        <div style="background:#fff;border:2px solid #2196F3;border-radius:10px;padding:20px;text-align:center;margin-bottom:24px">
+          <span style="font-size:42px;font-weight:bold;letter-spacing:14px;color:#1a1a1a;font-family:monospace">${otp}</span>
         </div>
-        <p style="color:#888;font-size:13px">This code expires in 10 minutes.</p>
+        <p style="color:#888;font-size:13px">This code expires in <strong>15 minutes</strong>.</p>
       </div>
-    `);
+      `
+    );
 
-    logger.info({ pending_id }, 'Registration email OTP resent');
-    res.json({ success: true, message: 'New code sent to your email.' });
+    logger.info({ pending_id }, 'Email OTP resent');
+    res.json({ success: true, message: 'A new verification code has been sent to your email.' });
   } catch (error) {
     next(error);
   }
@@ -760,7 +865,7 @@ app.post('/api/gyms/register/verify-phone', async (req: Request, res: Response, 
       if (dupGym.rows.length > 0) {
         await client.query('ROLLBACK');
         await pool.query(`DELETE FROM pending_registrations WHERE id = $1`, [pending_id]);
-        return res.status(409).json({ success: false, error: 'A gym with this email already exists.' });
+        return res.status(409).json({ success: false, error: 'An account with this email already exists.' });
       }
 
       const dupUser = await client.query(
@@ -809,10 +914,10 @@ app.post('/api/gyms/register/verify-phone', async (req: Request, res: Response, 
       );
 
       // Welcome email
-      await sendEmail(pending.owner_email, 'Welcome to Gym Retention! 🎉', `
+      await sendEmail(pending.owner_email, 'Welcome to Recurva! 🎉', `
         <div style="font-family:sans-serif;max-width:480px;margin:auto">
           <h2 style="color:#2196F3">You're all set!</h2>
-          <p>Your gym <strong>${pending.gym_name}</strong> is now registered. Your 30-day free trial has started.</p>
+          <p>Your business <strong>${pending.gym_name}</strong> is now registered on Recurva. Your 30-day free trial has started.</p>
           <p>You can log in using your email <strong>${pending.owner_email}</strong> or your registered phone number.</p>
         </div>
       `);
@@ -1039,13 +1144,29 @@ app.post('/api/auth/login', authLimiter, validate(loginSchema), async (req: Auth
         return res.status(401).json({ success: false, error: 'Invalid credentials' });
       }
 
-      // Check if gym is suspended
-      const gymCheck = await client.query(
-        `SELECT subscription_status FROM gyms WHERE id = $1`, [user.gym_id]
-      );
-      if (gymCheck.rows[0]?.subscription_status === 'suspended') {
+      // Check if gym is suspended or blocked
+      let gymCheckRow: any = null;
+      try {
+        const gymCheck = await client.query(
+          `SELECT subscription_status, is_blocked FROM gyms WHERE id = $1`, [user.gym_id]
+        );
+        gymCheckRow = gymCheck.rows[0];
+      } catch (colErr: any) {
+        // is_blocked column missing (migration not yet run) — fall back to status-only check
+        if (colErr?.message?.includes('is_blocked')) {
+          const gymCheck = await client.query(
+            `SELECT subscription_status FROM gyms WHERE id = $1`, [user.gym_id]
+          );
+          gymCheckRow = gymCheck.rows[0];
+        } else throw colErr;
+      }
+      if (gymCheckRow?.is_blocked) {
         loginAttempts.inc({ status: 'failed' });
-        return res.status(403).json({ success: false, error: 'Your gym account has been suspended. Please contact support.' });
+        return res.status(403).json({ success: false, error: 'Your account has been blocked. Please contact support.' });
+      }
+      if (gymCheckRow?.subscription_status === 'suspended') {
+        loginAttempts.inc({ status: 'failed' });
+        return res.status(403).json({ success: false, error: 'Your account has been suspended. Please contact support.' });
       }
 
       const accessToken = jwt.sign(
@@ -1133,53 +1254,109 @@ app.post('/api/auth/forgot-password', async (req: Request, res: Response, next: 
     }
     const { email } = parsed.data;
 
-    const client = await pool.connect();
-    try {
-      // Look up user by email (owners and trainers only)
-      const result = await client.query(
-        `SELECT u.id, u.gym_id FROM users u WHERE u.phone_or_email = $1 AND u.role IN ('owner','trainer') AND u.is_deleted = false LIMIT 1`,
-        [email]
-      );
+    // Look up user — always return 200 to prevent email enumeration
+    const result = await pool.query(
+      `SELECT u.id FROM users u WHERE u.phone_or_email = $1 AND u.role IN ('owner','trainer') AND u.is_deleted = false LIMIT 1`,
+      [email]
+    );
 
-      // Always return success to prevent email enumeration
-      if (result.rows.length === 0) {
-        return res.json({ success: true, message: 'If that email exists, a reset link has been sent.' });
-      }
-
-      const user = result.rows[0];
-      const token = crypto.randomBytes(32).toString('hex');
-      const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes
-
-      // Invalidate any existing tokens for this user
-      await client.query(
-        `DELETE FROM password_reset_tokens WHERE user_id = $1`,
-        [user.id]
-      );
-
-      await client.query(
-        `INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)`,
-        [user.id, token, expiresAt]
-      );
-
-      const resetUrl = `${process.env.CORS_ORIGIN}/#/reset-password?token=${token}`;
-      await sendEmail(email, 'Reset Your Password — Gym Retention', `
-        <div style="font-family:sans-serif;max-width:480px;margin:auto">
-          <h2 style="color:#2196F3">Password Reset</h2>
-          <p>You requested a password reset. Click the button below to set a new password.</p>
-          <p style="margin:24px 0">
-            <a href="${resetUrl}" style="background:#2196F3;color:#fff;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:bold">
-              Reset Password
-            </a>
-          </p>
-          <p style="color:#888;font-size:13px">This link expires in 30 minutes. If you didn't request this, you can ignore this email.</p>
-        </div>
-      `);
-
-      logger.info({ userId: user.id }, 'Password reset email sent');
-      res.json({ success: true, message: 'If that email exists, a reset link has been sent.' });
-    } finally {
-      client.release();
+    if (result.rows.length === 0) {
+      return res.json({ success: true, message: 'If that email exists, a code has been sent.' });
     }
+
+    const userId = result.rows[0].id;
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 min
+
+    // Reuse password_reset_tokens table: store OTP in token field prefixed with "otp:"
+    await pool.query(`DELETE FROM password_reset_tokens WHERE user_id = $1`, [userId]);
+    await pool.query(
+      `INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)`,
+      [userId, `otp:${otp}`, expiresAt]
+    );
+
+    await sendEmail(
+      email,
+      'Your Recurva Password Reset Code',
+      `
+      <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:32px;background:#f9f9f9;border-radius:12px">
+        <h2 style="color:#2196F3;margin-bottom:8px">Reset Your Password</h2>
+        <p style="color:#444;margin-bottom:24px">Use the code below to reset your <strong>Recurva</strong> account password.</p>
+        <div style="background:#fff;border:2px solid #2196F3;border-radius:10px;padding:20px;text-align:center;margin-bottom:24px">
+          <span style="font-size:42px;font-weight:bold;letter-spacing:14px;color:#1a1a1a;font-family:monospace">${otp}</span>
+        </div>
+        <p style="color:#888;font-size:13px">This code expires in <strong>15 minutes</strong>. Do not share it with anyone.</p>
+        <p style="color:#888;font-size:13px">If you didn't request a password reset, please ignore this email.</p>
+      </div>
+      `
+    );
+
+    logger.info({ userId }, 'Password reset OTP sent via email');
+    res.json({ success: true, message: 'If that email exists, a code has been sent.' });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/auth/verify-reset-otp — verify 6-digit OTP from forgot-password email, return reset token
+app.post('/api/auth/verify-reset-otp', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { email, otp_code } = req.body;
+    if (!email || !otp_code) {
+      return res.status(400).json({ success: false, error: 'email and otp_code are required' });
+    }
+
+    const userRes = await pool.query(
+      `SELECT u.id FROM users u WHERE u.phone_or_email = $1 AND u.role IN ('owner','trainer') AND u.is_deleted = false LIMIT 1`,
+      [email]
+    );
+    if (userRes.rows.length === 0) {
+      return res.status(400).json({ success: false, error: 'Incorrect code. Please try again.' });
+    }
+
+    const userId = userRes.rows[0].id;
+    const tokenRes = await pool.query(
+      `SELECT id, token, expires_at FROM password_reset_tokens WHERE user_id = $1 AND used_at IS NULL ORDER BY expires_at DESC LIMIT 1`,
+      [userId]
+    );
+
+    if (tokenRes.rows.length === 0) {
+      return res.status(400).json({ success: false, error: 'No reset request found. Please request a new code.' });
+    }
+
+    const row = tokenRes.rows[0];
+
+    if (new Date() > new Date(row.expires_at)) {
+      return res.status(400).json({ success: false, error: 'Code expired. Please request a new one.' });
+    }
+
+    if (!String(row.token).startsWith('otp:')) {
+      return res.status(400).json({ success: false, error: 'Invalid reset method. Please request a new code.' });
+    }
+
+    const storedOtp = String(row.token).replace('otp:', '');
+    let match = false;
+    try {
+      match = crypto.timingSafeEqual(
+        Buffer.from(String(otp_code).trim()),
+        Buffer.from(storedOtp)
+      );
+    } catch { match = false; }
+
+    if (!match) {
+      return res.status(400).json({ success: false, error: 'Incorrect code. Please try again.' });
+    }
+
+    // OTP correct — replace with a proper reset token for the reset-password step
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const newExpiry = new Date(Date.now() + 30 * 60 * 1000);
+    await pool.query(
+      `UPDATE password_reset_tokens SET token = $1, expires_at = $2 WHERE id = $3`,
+      [resetToken, newExpiry, row.id]
+    );
+
+    logger.info({ userId }, 'Password reset OTP verified — reset token issued');
+    res.json({ success: true, data: { reset_token: resetToken } });
   } catch (error) {
     next(error);
   }
@@ -1275,7 +1452,7 @@ app.post('/api/auth/send-otp', async (req: Request, res: Response, next: NextFun
         [email, code, expiresAt]
       );
 
-      await sendEmail(email, 'Your Gym Retention verification code', `
+      await sendEmail(email, 'Your Recurva verification code', `
         <div style="font-family:sans-serif;max-width:480px;margin:auto">
           <h2 style="color:#2196F3">Verify your email</h2>
           <p>Use the code below to verify your email address. It expires in <strong>10 minutes</strong>.</p>
@@ -1284,7 +1461,7 @@ app.post('/api/auth/send-otp', async (req: Request, res: Response, next: NextFun
               ${code}
             </span>
           </div>
-          <p style="color:#888;font-size:13px">If you didn't create a Gym Retention account, you can ignore this email.</p>
+          <p style="color:#888;font-size:13px">If you didn't create a Recurva account, you can ignore this email.</p>
         </div>
       `);
 
@@ -1396,6 +1573,31 @@ app.post('/api/auth/verify-firebase-token', async (req: Request, res: Response, 
     }
 
     const user = userRes.rows[0];
+
+    // Check if gym is blocked or suspended
+    let gymRow: any = null;
+    try {
+      const gymCheck = await pool.query(
+        `SELECT subscription_status, is_blocked FROM gyms WHERE id = $1 AND is_deleted = false LIMIT 1`,
+        [user.gym_id]
+      );
+      gymRow = gymCheck.rows[0];
+    } catch (colErr: any) {
+      if (colErr?.message?.includes('is_blocked')) {
+        const gymCheck = await pool.query(
+          `SELECT subscription_status FROM gyms WHERE id = $1 AND is_deleted = false LIMIT 1`,
+          [user.gym_id]
+        );
+        gymRow = gymCheck.rows[0];
+      } else throw colErr;
+    }
+    if (gymRow?.is_blocked) {
+      return res.status(403).json({ success: false, error: 'Your account has been blocked. Please contact support.' });
+    }
+    if (gymRow?.subscription_status === 'suspended') {
+      return res.status(403).json({ success: false, error: 'Your account has been suspended. Please contact support.' });
+    }
+
     const accessToken  = jwt.sign(
       { id: user.id, gym_id: user.gym_id, role: user.role },
       process.env.JWT_SECRET!,
@@ -1480,6 +1682,25 @@ app.post('/api/auth/phone-reset-token', async (req: Request, res: Response, next
 });
 
 // ============================================================================
+// FCM TOKEN — Save device push token for the authenticated user
+// PUT /api/auth/fcm-token
+// Body: { fcm_token: string }
+// ============================================================================
+
+app.put('/api/auth/fcm-token', authenticate, async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { fcm_token } = req.body;
+    if (!fcm_token || typeof fcm_token !== 'string') {
+      return res.status(400).json({ success: false, error: 'fcm_token is required' });
+    }
+    await pool.query(`UPDATE users SET fcm_token = $1 WHERE id = $2`, [fcm_token, req.user?.id]);
+    res.json({ success: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ============================================================================
 // BULK IMPORT — MEMBERS
 // POST /api/members/bulk-import
 // Body: { trainer_id: uuid, members: [...] }
@@ -1549,14 +1770,15 @@ app.post('/api/members/bulk-import', authenticate, authorize(['owner']), async (
       }
 
       const lastVisit  = m.last_visit_date ? new Date(m.last_visit_date) : null;
-      const daysSince  = lastVisit ? Math.floor((now.getTime() - lastVisit.getTime()) / 86400000) : 999;
-      const daysToExp  = Math.floor((expiryDate.getTime() - now.getTime()) / 86400000);
+      const baselineDate = lastVisit ?? now;
+      const daysSince  = (now.getTime() - baselineDate.getTime()) / 86400000;
+      const daysToExp  = (expiryDate.getTime() - now.getTime()) / 86400000;
 
       let status = 'active';
-      if (daysToExp <= 7 || daysSince > 10)  status = 'high_risk';
-      else if (daysSince > 5)                 status = 'at_risk';
+      if (daysToExp <= 7 || daysSince > 10)        status = 'high_risk';
+      else if (daysToExp <= 14 || daysSince > 5)   status = 'at_risk';
 
-      const uniqueId = `GYM-${now.getFullYear()}-${Math.floor(Math.random() * 99999).toString().padStart(5, '0')}`;
+      const uniqueId = `MEM-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
       const planFee  = m.plan_fee ?? 0;
 
       toInsert.push([
@@ -1689,7 +1911,10 @@ app.post('/api/trainers/bulk-import', authenticate, authorize(['owner']), async 
         imported++;
       } catch (err: any) {
         await client.query('ROLLBACK').catch(() => {});
-        const msg = err?.code === '23505' ? 'Duplicate entry' : (err?.message || 'Unknown error');
+        const msg = err?.code === '23505' ? 'Duplicate entry (phone or email already exists)'
+          : err?.code === '22001' ? 'A field value is too long'
+          : err?.code === '23502' ? 'A required field is missing'
+          : 'Failed to import this row. Please check the data.';
         errors.push({ row: rowNum, name: t.name, error: msg });
       } finally {
         client.release();
@@ -1757,9 +1982,10 @@ app.get('/api/members', authenticate, authorize(['owner', 'trainer']), async (re
       // Paginated data with same filters
       const dataParams = [...whereParams, limit, offset];
       const membersRes = await client.query(
-        `SELECT id, name, phone, email, last_visit_date, membership_expiry_date, plan_fee, status, created_at, assigned_trainer_id,
-          EXTRACT(DAY FROM NOW() - last_visit_date)::INTEGER AS days_last_visit,
-          EXTRACT(DAY FROM membership_expiry_date - NOW())::INTEGER AS days_to_expiry
+        `SELECT id, name, phone, email, last_visit_date, membership_expiry_date, plan_fee, created_at, assigned_trainer_id,
+          EXTRACT(EPOCH FROM (NOW() - last_visit_date))::INTEGER / 86400 AS days_last_visit,
+          EXTRACT(EPOCH FROM (membership_expiry_date - NOW()))::INTEGER / 86400 AS days_to_expiry,
+          (${MEMBER_STATUS_SQL}) AS status
          FROM members ${whereClause}
          ORDER BY created_at DESC
          LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`,
@@ -1789,30 +2015,52 @@ app.post('/api/members', authenticate, authorize(['owner']), validate(memberSche
     try {
       // Check phone uniqueness per gym
       const phoneCheck = await client.query(
-        'SELECT id FROM members WHERE gym_id = $1 AND phone = $2 AND is_deleted = false',
+        'SELECT id, is_deleted FROM members WHERE gym_id = $1 AND phone = $2',
         [req.gym_id, phone]
       );
       if (phoneCheck.rows.length > 0) {
-        return res.status(409).json({ success: false, error: 'Phone number already registered in this gym' });
+        const existing = phoneCheck.rows[0];
+        if (!existing.is_deleted) {
+          // Active member — block with friendly message
+          return res.status(409).json({ success: false, error: 'This phone number is already registered. Please use a different number.' });
+        }
+        // Deleted member — clear their phone to free up the unique slot so re-add is allowed
+        await client.query(
+          'UPDATE members SET phone = $1 WHERE id = $2',
+          [`_removed_${existing.id}`, existing.id]
+        );
       }
 
-      // Auto-calculate status per requirements:
-      // daysToExpiry <= 7 → high_risk (expiring soon, highest priority)
-      // daysLastVisit <= 5 → active
-      // 5 < daysLastVisit <= 10 → at_risk
-      // daysLastVisit > 10 → high_risk
+      // Check email uniqueness per gym (only if email provided)
+      if (email) {
+        const emailCheck = await client.query(
+          'SELECT id, is_deleted FROM members WHERE gym_id = $1 AND email = $2',
+          [req.gym_id, email]
+        );
+        if (emailCheck.rows.length > 0 && !emailCheck.rows[0].is_deleted) {
+          return res.status(409).json({ success: false, error: 'This email address is already registered. Please use a different email.' });
+        }
+        if (emailCheck.rows.length > 0 && emailCheck.rows[0].is_deleted) {
+          // Free up the email slot from the deleted record too
+          await client.query('UPDATE members SET email = $1 WHERE id = $2', [`_removed_${emailCheck.rows[0].id}`, emailCheck.rows[0].id]);
+        }
+      }
+
+      // Status uses created_at as baseline when no visit yet (new members start Active).
+      // daysToExpiry ≤ 7  OR daysSince > 10 → high_risk
+      // daysToExpiry ≤ 14 OR daysSince > 5  → at_risk   (parallel check)
       const now = new Date();
       const expiryDate = new Date(membership_expiry_date);
       const lastVisit = last_visit_date ? new Date(last_visit_date) : null;
-      const daysSinceVisit = lastVisit ? Math.floor((now.getTime() - lastVisit.getTime()) / 86400000) : 999;
-      const daysToExpiry = Math.floor((expiryDate.getTime() - now.getTime()) / 86400000);
+      const baseline = lastVisit ?? now;
+      const daysSinceVisit = (now.getTime() - baseline.getTime()) / 86400000;
+      const daysToExpiry   = (expiryDate.getTime() - now.getTime()) / 86400000;
 
       let status = 'active';
-      if (daysToExpiry <= 7) status = 'high_risk';
-      else if (daysSinceVisit > 10) status = 'high_risk';
-      else if (daysSinceVisit > 5) status = 'at_risk';
+      if (daysToExpiry <= 7 || daysSinceVisit > 10) status = 'high_risk';
+      else if (daysToExpiry <= 14 || daysSinceVisit > 5) status = 'at_risk';
 
-      const uniqueId = `GYM-${new Date().getFullYear()}-${Math.floor(Math.random() * 99999).toString().padStart(5, '0')}`;
+      const uniqueId = `MEM-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
 
       // Validate trainer belongs to this gym (only if provided)
       if (assigned_trainer_id) {
@@ -1864,6 +2112,15 @@ app.put('/api/members/:id', authenticate, authorize(['owner']), validate(memberS
 
     const client = await pool.connect();
     try {
+      // Check phone not taken by another member (include soft-deleted to avoid constraint error)
+      const phoneCheck = await client.query(
+        'SELECT id FROM members WHERE gym_id = $1 AND phone = $2 AND id != $3',
+        [req.gym_id, phone, id]
+      );
+      if (phoneCheck.rows.length > 0) {
+        return res.status(409).json({ success: false, error: 'This phone number is already registered. Please use a different number.' });
+      }
+
       const result = await client.query(
         `UPDATE members SET name = $1, phone = $2, email = $3, membership_expiry_date = $4, plan_fee = $5, updated_at = NOW()
          WHERE id = $6 AND gym_id = $7
@@ -2023,22 +2280,45 @@ app.get('/api/trainers/me', authenticate, authorize(['trainer']), async (req: Au
 app.patch('/api/trainers/:id', authenticate, authorize(['owner']), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
-    const { name, phone } = req.body;
+    const { name, phone, email } = req.body;
     if (!name || !phone) {
       return res.status(400).json({ success: false, error: 'name and phone are required' });
     }
     const client = await pool.connect();
     try {
+      await client.query('BEGIN');
+
+      // If email provided, update login email in users table too
+      if (email && email.trim()) {
+        const trainerUser = await client.query(
+          'SELECT u.id FROM users u JOIN trainers t ON t.user_id = u.id WHERE t.id = $1 AND t.gym_id = $2 AND t.is_deleted = false',
+          [id, req.gym_id]
+        );
+        if (trainerUser.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, error: 'Trainer not found' }); }
+
+        const userId = trainerUser.rows[0].id;
+        const existing = await client.query(
+          'SELECT id FROM users WHERE phone_or_email = $1 AND id != $2 AND is_deleted = false',
+          [email.trim(), userId]
+        );
+        if (existing.rows.length > 0) { await client.query('ROLLBACK'); return res.status(409).json({ success: false, error: 'This email is already in use.' }); }
+
+        await client.query('UPDATE users SET phone_or_email = $1 WHERE id = $2', [email.trim(), userId]);
+      }
+
       const result = await client.query(
-        `UPDATE trainers SET name = $1, phone = $2, updated_at = NOW()
+        `UPDATE trainers SET name = $1, phone = $2, ${email ? 'email = $5,' : ''} updated_at = NOW()
          WHERE id = $3 AND gym_id = $4 AND is_deleted = false
          RETURNING id, name, phone, email, assigned_members_count, is_active, created_at`,
-        [name, phone, id, req.gym_id]
+        email ? [name, phone, id, req.gym_id, email.trim()] : [name, phone, id, req.gym_id]
       );
-      if (result.rows.length === 0) {
-        return res.status(404).json({ success: false, error: 'Trainer not found' });
-      }
+      if (result.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, error: 'Trainer not found' }); }
+
+      await client.query('COMMIT');
       res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
     } finally {
       client.release();
     }
@@ -2238,9 +2518,33 @@ app.post('/api/tasks', authenticate, authorize(['owner']), validate(taskSchema),
         [req.gym_id, member_id, resolvedTrainerId, task_type, notes || null]
       );
 
+      const task = result.rows[0];
+
+      // Push notification to assigned trainer
+      if (resolvedTrainerId) {
+        const trainerRow = await client.query(
+          `SELECT u.fcm_token, t.name AS trainer_name, m.name AS member_name
+           FROM trainers t
+           LEFT JOIN users u ON u.gym_id = t.gym_id AND u.role = 'trainer' AND LOWER(u.phone_or_email) = LOWER(t.phone)
+           LEFT JOIN members m ON m.id = $2
+           WHERE t.id = $1`,
+          [resolvedTrainerId, member_id]
+        );
+        if (trainerRow.rows[0]?.fcm_token) {
+          const memberName = trainerRow.rows[0].member_name || 'a member';
+          const taskLabel  = task_type === 'renewal' ? 'Renewal follow-up' : 'Call follow-up';
+          await sendPush(
+            trainerRow.rows[0].fcm_token,
+            'New Task Assigned',
+            `${taskLabel} for ${memberName}`,
+            { task_id: String(task.id), type: 'task_assigned' }
+          );
+        }
+      }
+
       res.status(201).json({
         success: true,
-        data: result.rows[0]
+        data: task
       });
     } finally {
       client.release();
@@ -2351,6 +2655,35 @@ app.patch('/api/tasks/:id', authenticate, authorize(['trainer']), async (req: Au
             [req.gym_id, result.rows[0].member_id, id, memberRes.rows[0].plan_fee]
           );
         }
+      }
+
+      // Push notification to gym owner about task completion
+      const ownerRow = await client.query(
+        `SELECT u.fcm_token, m.name AS member_name, t.name AS trainer_name
+         FROM users u
+         LEFT JOIN follow_up_tasks ft ON ft.id = $1
+         LEFT JOIN members m ON m.id = ft.member_id
+         LEFT JOIN trainers t ON t.id = ft.assigned_trainer_id
+         WHERE u.gym_id = $2 AND u.role = 'owner' AND u.is_deleted = false
+         LIMIT 1`,
+        [id, req.gym_id]
+      );
+      if (ownerRow.rows[0]?.fcm_token) {
+        const memberName  = ownerRow.rows[0].member_name  || 'a member';
+        const trainerName = ownerRow.rows[0].trainer_name || 'Staff';
+        const outcomeLabel: Record<string, string> = {
+          called: 'called',
+          not_reachable: 'could not reach',
+          coming_tomorrow: 'is coming tomorrow',
+          renewed: 'renewed — great news!',
+          no_action: 'marked no action',
+        };
+        await sendPush(
+          ownerRow.rows[0].fcm_token,
+          'Task Completed',
+          `${trainerName} ${outcomeLabel[outcome] || outcome} ${memberName}`,
+          { task_id: String(id), type: 'task_completed', outcome }
+        );
       }
 
       res.json({ success: true, data: { id } });
@@ -2508,6 +2841,7 @@ app.get('/api/members/:memberId/attendance', authenticate, authorize(['owner', '
 const updateProfileSchema = z.object({
   name: z.string().min(2).max(100),
   phone: z.string().min(10).max(20).optional().or(z.literal('')),
+  email: z.string().email().optional().or(z.literal('')),
   currentPassword: z.string().optional(),
   newPassword: z.string().min(6).optional(),
 });
@@ -2525,7 +2859,7 @@ app.get('/api/profile', authenticate, async (req: AuthRequest, res: Response, ne
     try {
       if (req.user.role === 'owner') {
         const result = await client.query(
-          `SELECT u.id, u.phone_or_email, u.phone,
+          `SELECT u.id, u.phone_or_email, u.phone, u.phone_verified,
                   g.owner_name as name, g.id as gym_id,
                   g.name as gym_name, g.address as gym_address,
                   g.phone as gym_phone, g.email as gym_email
@@ -2543,6 +2877,7 @@ app.get('/api/profile', authenticate, async (req: AuthRequest, res: Response, ne
             name: row.name,
             email: row.phone_or_email,
             phone: row.phone || '',
+            phoneVerified: row.phone_verified ?? true,
             role: 'owner',
             gym: {
               id: row.gym_id,
@@ -2555,7 +2890,7 @@ app.get('/api/profile', authenticate, async (req: AuthRequest, res: Response, ne
         });
       } else {
         const result = await client.query(
-          `SELECT u.id, u.phone_or_email, t.name, t.phone, t.email, t.id as trainer_id
+          `SELECT u.id, u.phone_or_email, u.phone_verified, t.name, t.phone, t.email, t.id as trainer_id
            FROM users u
            JOIN trainers t ON t.user_id = u.id
            WHERE u.id = $1 AND t.is_deleted = false`,
@@ -2570,6 +2905,7 @@ app.get('/api/profile', authenticate, async (req: AuthRequest, res: Response, ne
             name: row.name,
             email: row.email,
             phone: row.phone || '',
+            phoneVerified: row.phone_verified ?? false,
             role: 'trainer',
           }
         });
@@ -2585,7 +2921,7 @@ app.get('/api/profile', authenticate, async (req: AuthRequest, res: Response, ne
 // PUT /api/profile — update name, phone, optional password
 app.put('/api/profile', authenticate, validate(updateProfileSchema), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const { name, phone, currentPassword, newPassword } = req.body;
+    const { name, phone, email, currentPassword, newPassword } = req.body;
     const client = await pool.connect();
     try {
       // Optional password change
@@ -2600,17 +2936,74 @@ app.put('/api/profile', authenticate, validate(updateProfileSchema), async (req:
 
       if (req.user.role === 'owner') {
         await client.query('UPDATE gyms SET owner_name = $1 WHERE id = $2', [name, req.gym_id]);
-        if (phone) await client.query('UPDATE users SET phone = $1 WHERE id = $2', [phone, req.user.id]);
+        if (phone) await client.query('UPDATE users SET phone = $1, phone_verified = false WHERE id = $2', [phone, req.user.id]);
+        // Email update — check uniqueness first
+        if (email && email.trim()) {
+          const existing = await client.query(
+            'SELECT id FROM users WHERE phone_or_email = $1 AND id != $2 AND is_deleted = false',
+            [email.trim(), req.user.id]
+          );
+          if (existing.rows.length > 0) return res.status(409).json({ success: false, error: 'This email is already in use by another account.' });
+          await client.query('UPDATE users SET phone_or_email = $1 WHERE id = $2', [email.trim(), req.user.id]);
+          await client.query('UPDATE gyms SET email = $1 WHERE id = $2', [email.trim(), req.gym_id]);
+        }
       } else {
         await client.query(
           'UPDATE trainers SET name = $1, phone = $2 WHERE user_id = $3 AND gym_id = $4',
           [name, phone || '', req.user.id, req.gym_id]
         );
+        if (phone) await client.query('UPDATE users SET phone = $1, phone_verified = false WHERE id = $2', [phone, req.user.id]);
+        if (email && email.trim()) {
+          const existing = await client.query(
+            'SELECT id FROM users WHERE phone_or_email = $1 AND id != $2 AND is_deleted = false',
+            [email.trim(), req.user.id]
+          );
+          if (existing.rows.length > 0) return res.status(409).json({ success: false, error: 'This email is already in use by another account.' });
+          await client.query('UPDATE users SET phone_or_email = $1 WHERE id = $2', [email.trim(), req.user.id]);
+          await client.query('UPDATE trainers SET email = $1 WHERE user_id = $2 AND gym_id = $3', [email.trim(), req.user.id, req.gym_id]);
+        }
       }
       res.json({ success: true, data: { message: 'Profile updated successfully' } });
     } finally {
       client.release();
     }
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/profile/verify-phone — verify Firebase phone token and mark phone as verified
+app.post('/api/profile/verify-phone', authenticate, async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    if (!firebaseInitialized) return res.status(503).json({ success: false, error: 'Firebase not configured' });
+    const { firebase_id_token } = req.body;
+    if (!firebase_id_token) return res.status(400).json({ success: false, error: 'firebase_id_token is required' });
+
+    let decoded: admin.auth.DecodedIdToken;
+    try {
+      decoded = await admin.auth().verifyIdToken(firebase_id_token);
+    } catch {
+      return res.status(401).json({ success: false, error: 'Invalid or expired verification token' });
+    }
+
+    const verifiedPhone = decoded.phone_number;
+    if (!verifiedPhone) return res.status(400).json({ success: false, error: 'No phone number in token' });
+
+    // Update phone and mark as verified
+    await pool.query(
+      'UPDATE users SET phone = $1, phone_verified = true WHERE id = $2',
+      [verifiedPhone, req.user.id]
+    );
+
+    // Also update trainers table if trainer
+    if (req.user.role === 'trainer') {
+      await pool.query(
+        'UPDATE trainers SET phone = $1 WHERE user_id = $2',
+        [verifiedPhone, req.user.id]
+      );
+    }
+
+    res.json({ success: true, data: { message: 'Phone verified successfully', phone: verifiedPhone } });
   } catch (error) {
     next(error);
   }
@@ -2639,6 +3032,24 @@ app.put('/api/gyms/me', authenticate, authorize(['owner']), validate(updateGymSc
 // DASHBOARD ENDPOINTS
 // ============================================================================
 
+// Shared SQL expression to compute member status dynamically.
+// Priority: high_risk > at_risk > active
+// daysToExpiry  ≤ 7  OR daysSinceActivity > 10  → high_risk
+// daysToExpiry  ≤ 14 OR daysSinceActivity > 5   → at_risk
+// else                                           → active
+// daysSinceActivity uses COALESCE(last_visit_date, created_at) so new members start Active.
+const MEMBER_STATUS_SQL = `
+  CASE
+    WHEN EXTRACT(EPOCH FROM (membership_expiry_date - NOW())) / 86400 <= 7
+      OR EXTRACT(EPOCH FROM (NOW() - COALESCE(last_visit_date, created_at))) / 86400 > 10
+    THEN 'high_risk'
+    WHEN EXTRACT(EPOCH FROM (membership_expiry_date - NOW())) / 86400 <= 14
+      OR EXTRACT(EPOCH FROM (NOW() - COALESCE(last_visit_date, created_at))) / 86400 > 5
+    THEN 'at_risk'
+    ELSE 'active'
+  END
+`.trim();
+
 app.get('/api/dashboard/kpis', authenticate, authorize(['owner']), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const client = await pool.connect();
@@ -2646,9 +3057,9 @@ app.get('/api/dashboard/kpis', authenticate, authorize(['owner']), async (req: A
       const [membersRes, revenueRes] = await Promise.all([
         client.query(
           `SELECT
-            COUNT(CASE WHEN status = 'active' THEN 1 END) as active_members,
-            COUNT(CASE WHEN status = 'at_risk' THEN 1 END) as at_risk_members,
-            COUNT(CASE WHEN status = 'high_risk' THEN 1 END) as high_risk_members,
+            COUNT(CASE WHEN (${MEMBER_STATUS_SQL}) = 'active'    THEN 1 END) as active_members,
+            COUNT(CASE WHEN (${MEMBER_STATUS_SQL}) = 'at_risk'   THEN 1 END) as at_risk_members,
+            COUNT(CASE WHEN (${MEMBER_STATUS_SQL}) = 'high_risk' THEN 1 END) as high_risk_members,
             COUNT(*) as total_members
            FROM members WHERE gym_id = $1 AND is_deleted = false`,
           [req.gym_id]
@@ -2783,25 +3194,19 @@ cron.schedule('0 9 * * *', async () => {
           continue;
         }
 
-        await sendEmail(
-          gym.email,
-          `${gym.name} — Trial Expiring in ${gym.days_remaining} Day${gym.days_remaining === 1 ? '' : 's'}`,
-          `
-            <div style="font-family:sans-serif;max-width:480px;margin:auto">
-              <h2 style="color:#2196F3">Trial Expiring Soon</h2>
-              <p>Hi ${gym.owner_name},</p>
-              <p>Your <strong>${gym.name}</strong> trial expires in <strong>${gym.days_remaining} day${gym.days_remaining === 1 ? '' : 's'}</strong>.</p>
-              <p>Upgrade now to keep access to all features and continue managing your gym members without interruption.</p>
-              <p style="margin-top:24px">
-                <a href="${process.env.CORS_ORIGIN}/#/subscription"
-                   style="background:#2196F3;color:#fff;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:bold">
-                  Upgrade Now
-                </a>
-              </p>
-            </div>
-          `
+        // Push notification to gym owner
+        const ownerTokenRow = await client.query(
+          `SELECT u.fcm_token FROM users u WHERE u.gym_id = $1 AND u.role = 'owner' AND u.is_deleted = false LIMIT 1`,
+          [gym.id]
         );
-        logger.info({ gymId: gym.id, notifType }, 'Trial expiry notification sent');
+        const d = gym.days_remaining;
+        await sendPush(
+          ownerTokenRow.rows[0]?.fcm_token,
+          `Trial Expiring in ${d} Day${d === 1 ? '' : 's'}`,
+          `${gym.name} — Upgrade now to keep all features active.`,
+          { type: 'trial_expiry', days_remaining: String(d), gym_id: String(gym.id) }
+        );
+        logger.info({ gymId: gym.id, notifType }, 'Trial expiry push sent');
       }
     } finally {
       client.release();
@@ -2821,10 +3226,11 @@ cron.schedule('0 0 * * *', async () => {
       await client.query('BEGIN');
 
       const result = await client.query(`
-        SELECT m.id, m.gym_id, EXTRACT(DAY FROM NOW() - m.last_visit_date) as days_inactive
+        SELECT m.id, m.gym_id,
+               EXTRACT(DAY FROM NOW() - COALESCE(m.last_visit_date, m.created_at))::int AS days_inactive
         FROM members m
         WHERE m.is_deleted = false
-          AND (EXTRACT(DAY FROM NOW() - m.last_visit_date) > 10 OR m.last_visit_date IS NULL)
+          AND EXTRACT(DAY FROM NOW() - COALESCE(m.last_visit_date, m.created_at)) > 10
           AND NOT EXISTS (
             SELECT 1 FROM follow_up_tasks t WHERE t.member_id = m.id AND t.status = 'pending'
           )
@@ -2849,6 +3255,21 @@ cron.schedule('0 0 * * *', async () => {
     }
   } catch (error) {
     logger.error({ error }, 'Task generation failed');
+    if (process.env.SENTRY_DSN) Sentry.captureException(error);
+  }
+});
+
+// Daily member status recalculation at 00:05 — keeps stored status in sync with actual data
+cron.schedule('5 0 * * *', async () => {
+  logger.info('Running daily member status recalculation');
+  try {
+    const result = await pool.query(`
+      UPDATE members SET status = ${MEMBER_STATUS_SQL}
+      WHERE is_deleted = false
+    `);
+    logger.info({ updated: result.rowCount }, 'Member statuses recalculated');
+  } catch (error) {
+    logger.error({ error }, 'Member status recalculation failed');
     if (process.env.SENTRY_DSN) Sentry.captureException(error);
   }
 });
@@ -2960,18 +3381,38 @@ const adminAuth = (req: Request, res: Response, next: NextFunction) => {
 
 // GET /api/admin/gyms — list all gyms with status, days remaining, member count
 app.get('/api/admin/gyms', adminAuth, async (req: Request, res: Response) => {
+  const baseSelect = `
+    SELECT
+      g.id,
+      g.name,
+      g.email,
+      g.phone,
+      g.owner_name,
+      g.created_at,
+      g.trial_ends_at,
+      g.subscription_ends_at,
+      g.subscription_status,
+      COUNT(m.id) AS member_count,
+      CASE
+        WHEN g.subscription_status = 'active' AND g.subscription_ends_at > NOW()
+          THEN EXTRACT(DAY FROM (g.subscription_ends_at - NOW()))::int
+        WHEN g.subscription_status = 'trial' AND g.trial_ends_at IS NOT NULL
+          THEN GREATEST(0, EXTRACT(DAY FROM (g.trial_ends_at - NOW()))::int)
+        ELSE 0
+      END AS days_remaining
+    FROM gyms g
+    LEFT JOIN members m ON m.gym_id = g.id AND m.is_deleted = false
+    WHERE g.is_deleted = false
+    GROUP BY g.id
+    ORDER BY g.created_at DESC
+  `;
   try {
+    // Try full query including block columns (requires migration_gym_block.sql to have been run)
     const result = await pool.query(`
       SELECT
-        g.id,
-        g.name,
-        g.email,
-        g.phone,
-        g.owner_name,
-        g.created_at,
-        g.trial_ends_at,
-        g.subscription_ends_at,
-        g.subscription_status,
+        g.id, g.name, g.email, g.phone, g.owner_name, g.created_at,
+        g.trial_ends_at, g.subscription_ends_at, g.subscription_status,
+        g.is_blocked, g.blocked_at, g.blocked_reason,
         COUNT(m.id) AS member_count,
         CASE
           WHEN g.subscription_status = 'active' AND g.subscription_ends_at > NOW()
@@ -2981,25 +3422,42 @@ app.get('/api/admin/gyms', adminAuth, async (req: Request, res: Response) => {
           ELSE 0
         END AS days_remaining
       FROM gyms g
-      LEFT JOIN members m ON m.gym_id = g.id
+      LEFT JOIN members m ON m.gym_id = g.id AND m.is_deleted = false
       WHERE g.is_deleted = false
       GROUP BY g.id
       ORDER BY g.created_at DESC
     `);
     res.json({ success: true, data: { gyms: result.rows } });
   } catch (err: any) {
+    // Fallback: migration_gym_block.sql not yet run — return without block columns
+    if (err?.message?.includes('column') && err?.message?.includes('does not exist')) {
+      try {
+        const result = await pool.query(baseSelect);
+        const rows = result.rows.map((r: any) => ({ ...r, is_blocked: false, blocked_at: null, blocked_reason: null }));
+        res.json({ success: true, data: { gyms: rows, _migration_needed: 'Run database/migration_gym_block.sql in Supabase SQL editor to enable block/unblock feature' } });
+        return;
+      } catch (fallbackErr: any) {
+        logger.error({ fallbackErr }, 'Admin: fallback list gyms also failed');
+      }
+    }
     logger.error({ err }, 'Admin: failed to list gyms');
     res.status(500).json({ success: false, error: 'Failed to fetch gyms' });
   }
 });
 
+const _uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // POST /api/admin/gyms/:id/suspend — set subscription_status = 'suspended'
 app.post('/api/admin/gyms/:id/suspend', adminAuth, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    await pool.query(`UPDATE gyms SET subscription_status = 'suspended' WHERE id = $1`, [id]);
+    if (!_uuidRe.test(id)) return res.status(404).json({ success: false, error: 'Gym not found' });
+    const result = await pool.query(
+      `UPDATE gyms SET subscription_status = 'suspended' WHERE id = $1 AND is_deleted = false RETURNING name`, [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Gym not found' });
     logger.info({ gymId: id }, 'Admin: gym suspended');
-    res.json({ success: true, data: { message: 'Gym suspended' } });
+    res.json({ success: true, data: { message: `"${result.rows[0].name}" suspended` } });
   } catch (err: any) {
     res.status(500).json({ success: false, error: 'Failed to suspend gym' });
   }
@@ -3009,18 +3467,56 @@ app.post('/api/admin/gyms/:id/suspend', adminAuth, async (req: Request, res: Res
 app.post('/api/admin/gyms/:id/reactivate', adminAuth, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    // Restore to 'trial' if no paid subscription, else 'active'
+    if (!_uuidRe.test(id)) return res.status(404).json({ success: false, error: 'Gym not found' });
     const result = await pool.query(
-      `SELECT subscription_ends_at FROM gyms WHERE id = $1`, [id]
+      `SELECT name, subscription_ends_at FROM gyms WHERE id = $1 AND is_deleted = false`, [id]
     );
+    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Gym not found' });
     const gym = result.rows[0];
-    const newStatus = gym?.subscription_ends_at && new Date(gym.subscription_ends_at) > new Date()
+    const newStatus = gym.subscription_ends_at && new Date(gym.subscription_ends_at) > new Date()
       ? 'active' : 'trial';
     await pool.query(`UPDATE gyms SET subscription_status = $1 WHERE id = $2`, [newStatus, id]);
     logger.info({ gymId: id, newStatus }, 'Admin: gym reactivated');
-    res.json({ success: true, data: { message: 'Gym reactivated' } });
+    res.json({ success: true, data: { message: `"${gym.name}" reactivated as ${newStatus}` } });
   } catch (err: any) {
     res.status(500).json({ success: false, error: 'Failed to reactivate gym' });
+  }
+});
+
+// POST /api/admin/gyms/:id/block — block gym access (logins and API requests rejected immediately)
+app.post('/api/admin/gyms/:id/block', adminAuth, async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    if (!_uuidRe.test(id)) return res.status(404).json({ success: false, error: 'Gym not found' });
+    const { reason } = req.body;
+    const result = await pool.query(
+      `UPDATE gyms SET is_blocked = true, blocked_at = NOW(), blocked_reason = $1 WHERE id = $2 AND is_deleted = false RETURNING name`,
+      [reason ?? null, id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Gym not found' });
+    logger.info({ gymId: id, reason }, 'Admin: gym blocked');
+    res.json({ success: true, data: { message: `"${result.rows[0].name}" has been blocked. All logins and API access are denied immediately.` } });
+  } catch (err: any) {
+    logger.error(err, 'Admin block gym failed');
+    res.status(500).json({ success: false, error: 'Failed to block gym' });
+  }
+});
+
+// POST /api/admin/gyms/:id/unblock — restore gym access
+app.post('/api/admin/gyms/:id/unblock', adminAuth, async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    if (!_uuidRe.test(id)) return res.status(404).json({ success: false, error: 'Gym not found' });
+    const result = await pool.query(
+      `UPDATE gyms SET is_blocked = false, blocked_at = NULL, blocked_reason = NULL WHERE id = $1 AND is_deleted = false RETURNING name`,
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Gym not found' });
+    logger.info({ gymId: id }, 'Admin: gym unblocked');
+    res.json({ success: true, data: { message: `"${result.rows[0].name}" has been unblocked. Access restored.` } });
+  } catch (err: any) {
+    logger.error(err, 'Admin unblock gym failed');
+    res.status(500).json({ success: false, error: 'Failed to unblock gym' });
   }
 });
 
@@ -3032,18 +3528,21 @@ const convertGymSchema = z.object({
 app.post('/api/admin/gyms/:id/convert', adminAuth, validate(convertGymSchema), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    if (!_uuidRe.test(id)) return res.status(404).json({ success: false, error: 'Gym not found' });
     const { months } = req.body;
     const endsAt = new Date();
     endsAt.setMonth(endsAt.getMonth() + months);
 
-    await pool.query(
+    const result = await pool.query(
       `UPDATE gyms
        SET subscription_status = 'active',
            subscription_ends_at = $1,
            is_active = true
-       WHERE id = $2`,
+       WHERE id = $2 AND is_deleted = false
+       RETURNING name`,
       [endsAt.toISOString(), id]
     );
+    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Gym not found' });
     logger.info({ gymId: id, months }, 'Admin: gym converted to paid');
     res.json({ success: true, data: { message: `Subscription activated for ${months} month(s)`, ends_at: endsAt } });
   } catch (err: any) {
@@ -3051,21 +3550,75 @@ app.post('/api/admin/gyms/:id/convert', adminAuth, validate(convertGymSchema), a
   }
 });
 
-// DELETE /api/admin/gyms/:id — permanently delete a gym and all its data
+// DELETE /api/admin/gyms/:id — permanently delete a gym and ALL its data
+// Cascade order: audit_logs, revenue_records, attendance_logs, follow_up_tasks,
+//   members, trainers, password_reset_tokens, subscription_billing,
+//   gym_notifications, trial_conversion_log, users → then gyms.
+// All child tables have ON DELETE CASCADE so a single DELETE on gyms handles everything.
 app.delete('/api/admin/gyms/:id', adminAuth, async (req: Request, res: Response) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
-    const gymRes = await client.query(`SELECT name FROM gyms WHERE id = $1`, [id]);
+    if (!_uuidRe.test(id)) {
+      client.release();
+      return res.status(404).json({ success: false, error: 'Gym not found' });
+    }
+
+    await client.query('BEGIN');
+    const gymRes = await client.query(`SELECT name FROM gyms WHERE id = $1 FOR UPDATE`, [id]);
     if (gymRes.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ success: false, error: 'Gym not found' });
     }
     const gymName = gymRes.rows[0].name;
-    // CASCADE is set on all child tables so deleting from gyms removes everything
+
+    // Explicit cascade deletions for full trace removal
+    // (ON DELETE CASCADE handles these automatically, but explicit deletes
+    //  give us row counts for logging and make the intent crystal-clear)
+    const [auditDel, revDel, attendDel, taskDel, memberDel, trainerDel, billingDel] = await Promise.all([
+      client.query(`DELETE FROM audit_logs WHERE gym_id = $1`, [id]),
+      client.query(`DELETE FROM revenue_records WHERE gym_id = $1`, [id]),
+      client.query(`DELETE FROM attendance_logs WHERE gym_id = $1`, [id]),
+      client.query(`DELETE FROM follow_up_tasks WHERE gym_id = $1`, [id]),
+      client.query(`DELETE FROM members WHERE gym_id = $1`, [id]),
+      client.query(`DELETE FROM trainers WHERE gym_id = $1`, [id]),
+      client.query(`DELETE FROM subscription_billing WHERE gym_id = $1`, [id]),
+    ]);
+    await client.query(`DELETE FROM gym_notifications WHERE gym_id = $1`, [id]);
+    await client.query(`DELETE FROM trial_conversion_log WHERE gym_id = $1`, [id]);
+    // password_reset_tokens cascade from users; delete users before gym
+    await client.query(`DELETE FROM users WHERE gym_id = $1`, [id]);
     await client.query(`DELETE FROM gyms WHERE id = $1`, [id]);
-    logger.info({ gymId: id, gymName }, 'Admin: gym permanently deleted');
-    res.json({ success: true, data: { message: `"${gymName}" and all its data have been permanently deleted` } });
+    await client.query('COMMIT');
+
+    logger.info({
+      gymId: id, gymName,
+      deleted: {
+        members: memberDel.rowCount,
+        trainers: trainerDel.rowCount,
+        tasks: taskDel.rowCount,
+        attendance: attendDel.rowCount,
+        revenue: revDel.rowCount,
+        audit: auditDel.rowCount,
+        billing: billingDel.rowCount,
+      }
+    }, 'Admin: gym permanently deleted with all data');
+
+    res.json({
+      success: true,
+      data: {
+        message: `"${gymName}" and all its data have been permanently deleted`,
+        deleted: {
+          members: memberDel.rowCount,
+          trainers: trainerDel.rowCount,
+          tasks: taskDel.rowCount,
+          attendance: attendDel.rowCount,
+          revenue: revDel.rowCount,
+        }
+      }
+    });
   } catch (err: any) {
+    await client.query('ROLLBACK').catch(() => {});
     logger.error(err, 'Admin delete gym failed');
     res.status(500).json({ success: false, error: 'Failed to delete gym' });
   } finally {
@@ -3090,8 +3643,8 @@ app.use((req: Request, res: Response) => {
 
 // K_SERVICE is set by Google Cloud Run / Firebase Functions environment.
 // FUNCTION_TARGET is set by the Firebase Functions emulator.
-// If neither is set, we're running locally and should start the HTTP server.
-if (!process.env.K_SERVICE && !process.env.FUNCTION_TARGET) {
+// require.main === module ensures we don't listen when imported by firebase-entry.
+if (!process.env.K_SERVICE && !process.env.FUNCTION_TARGET && require.main === module) {
   const PORT = parseInt(process.env.PORT || '3000');
 
   const server = app.listen(PORT, () => {
