@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "611414847570",
+    "project_id": "recurva-app",
+    "storage_bucket": "recurva-app.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:611414847570:android:4f5dba080a9c9b0113ef8b",
+        "android_client_info": {
+          "package_name": "com.example.gym_fitness_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC7hJ02xdmpFgIfIp4_iKKcobdoPuELBpc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

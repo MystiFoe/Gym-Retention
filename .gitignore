@@ -1,15 +1,41 @@
+# ── Node / Backend ────────────────────────────────────────────────────────────
 node_modules/
-dist/
-.env
-.env.local
-.env.*.local
+backend/.env
+backend/.env.*
+backend/backend.log
 *.log
-.vscode/
-.idea/
-.DS_Store
-coverage/
-.nyc_output/
-build/
-# Flutter web build output (generated — run deploy.sh to rebuild)
-public/
-!public/.gitkeep
+
+# ── Flutter ───────────────────────────────────────────────────────────────────
+flutter/build/
+flutter/.dart_tool/
+flutter/.flutter-plugins
+flutter/.flutter-plugins-dependencies
+flutter/*.iml
+flutter/.packages
+flutter/android/.gradle/
+flutter/android/local.properties
+flutter/ios/Pods/
+flutter/ios/.symlinks/
+
+# ── Firebase hosting build artifacts ─────────────────────────────────────────
+public/main.dart.js
+public/flutter_service_worker.js
+public/flutter.js
+public/flutter_bootstrap.js
+public/assets/
+public/canvaskit/
+public/icons/
+public/favicon.png
+public/manifest.json
+public/version.json
+public/app.js
+
+# ── Firebase local cache ──────────────────────────────────────────────────────
+.firebase/
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+backups/
+*.apk
+*.aab
+certs/
+console.log*

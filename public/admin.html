@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Recurva Admin</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f0f4f8; min-height: 100vh; }
+
+  /* LOGIN */
+  #loginPage { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  .login-card { background: #fff; border-radius: 16px; padding: 40px; width: 360px; box-shadow: 0 4px 24px rgba(0,0,0,.10); text-align: center; }
+  .login-card .logo { font-size: 40px; margin-bottom: 8px; }
+  .login-card h1 { font-size: 24px; font-weight: 700; color: #1a1a2e; }
+  .login-card p { color: #888; font-size: 13px; margin: 4px 0 28px; }
+  .login-card input { width: 100%; padding: 12px 16px; border: 1.5px solid #dde3ee; border-radius: 10px; font-size: 15px; outline: none; margin-bottom: 16px; }
+  .login-card input:focus { border-color: #2196F3; }
+  .login-card button { width: 100%; padding: 13px; background: #2196F3; color: #fff; border: none; border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer; }
+  .login-card button:hover { background: #1976D2; }
+  #loginError { color: #e53935; font-size: 13px; margin-top: 12px; display: none; }
+
+  /* DASHBOARD */
+  #dashboard { display: none; }
+  .topbar { background: #1a1a2e; color: #fff; padding: 16px 28px; display: flex; justify-content: space-between; align-items: center; }
+  .topbar h2 { font-size: 18px; font-weight: 700; }
+  .topbar .stats { display: flex; gap: 24px; font-size: 13px; opacity: .8; }
+  .topbar .stats span b { color: #fff; }
+  .logout-btn { background: rgba(255,255,255,.15); border: none; color: #fff; padding: 7px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+  .logout-btn:hover { background: rgba(255,255,255,.25); }
+
+  .content { padding: 24px 28px; }
+  .search-bar { width: 100%; max-width: 400px; padding: 10px 16px; border: 1.5px solid #dde3ee; border-radius: 10px; font-size: 14px; margin-bottom: 20px; outline: none; }
+  .search-bar:focus { border-color: #2196F3; }
+
+  table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 12px rgba(0,0,0,.06); }
+  th { background: #f5f7fa; text-align: left; padding: 12px 16px; font-size: 12px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: .5px; }
+  td { padding: 14px 16px; border-top: 1px solid #f0f0f0; font-size: 14px; color: #333; vertical-align: middle; }
+  tr:hover td { background: #fafbff; }
+
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+  .badge-trial { background: #fff3e0; color: #e65100; }
+  .badge-active { background: #e8f5e9; color: #2e7d32; }
+  .badge-suspended { background: #fce4ec; color: #c62828; }
+  .badge-blocked { background: #263238; color: #fff; }
+
+  .action-btn { padding: 5px 12px; border: none; border-radius: 7px; font-size: 12px; font-weight: 600; cursor: pointer; margin: 0 2px; }
+  .btn-suspend { background: #fff3e0; color: #e65100; }
+  .btn-reactivate { background: #e8f5e9; color: #2e7d32; }
+  .btn-block { background: #fce4ec; color: #c62828; }
+  .btn-unblock { background: #e3f2fd; color: #1565c0; }
+  .btn-delete { background: #ffebee; color: #b71c1c; }
+  .btn-activate { background: #e8f5e9; color: #1b5e20; }
+  .action-btn:hover { opacity: .8; }
+
+  .loading { text-align: center; padding: 60px; color: #888; font-size: 16px; }
+  .empty { text-align: center; padding: 60px; color: #aaa; }
+
+  /* MODAL */
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 1000; align-items: center; justify-content: center; }
+  .modal-overlay.show { display: flex; }
+  .modal { background: #fff; border-radius: 16px; padding: 28px; width: 360px; box-shadow: 0 8px 40px rgba(0,0,0,.2); }
+  .modal h3 { font-size: 18px; margin-bottom: 8px; }
+  .modal p { color: #666; font-size: 14px; margin-bottom: 20px; }
+  .modal input { width: 100%; padding: 10px 14px; border: 1.5px solid #dde3ee; border-radius: 8px; font-size: 14px; margin-bottom: 16px; outline: none; }
+  .modal input:focus { border-color: #2196F3; }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+  .modal-actions button { padding: 9px 20px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; }
+  .btn-cancel { background: #f5f5f5; color: #333; }
+  .btn-confirm { background: #2196F3; color: #fff; }
+  .btn-danger { background: #e53935; color: #fff; }
+</style>
+</head>
+<body>
+
+<!-- LOGIN PAGE -->
+<div id="loginPage">
+  <div class="login-card">
+    <div class="logo">🛡️</div>
+    <h1>Recurva Admin</h1>
+    <p>Internal access only</p>
+    <input type="password" id="secretInput" placeholder="Admin Secret" onkeydown="if(event.key==='Enter')login()">
+    <button onclick="login()">Sign In</button>
+    <div id="loginError"></div>
+  </div>
+</div>
+
+<!-- DASHBOARD -->
+<div id="dashboard">
+  <div class="topbar">
+    <div>
+      <h2>Recurva Admin Panel</h2>
+    </div>
+    <div class="stats" id="statsBar"></div>
+    <button class="logout-btn" onclick="logout()">Logout</button>
+  </div>
+  <div class="content">
+    <input class="search-bar" type="text" placeholder="Search by business name, email or owner..." oninput="filterTable(this.value)">
+    <div id="tableArea"><div class="loading">Loading businesses…</div></div>
+  </div>
+</div>
+
+<!-- ACTIVATE MODAL -->
+<div class="modal-overlay" id="activateModal">
+  <div class="modal">
+    <h3>Activate Subscription</h3>
+    <p id="activateModalName"></p>
+    <input type="number" id="monthsInput" placeholder="Number of months" min="1" max="24" value="1">
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeModal('activateModal')">Cancel</button>
+      <button class="btn-confirm" onclick="confirmActivate()">Activate</button>
+    </div>
+  </div>
+</div>
+
+<!-- DELETE MODAL -->
+<div class="modal-overlay" id="deleteModal">
+  <div class="modal">
+    <h3>Delete Business</h3>
+    <p id="deleteModalDesc"></p>
+    <input type="text" id="deleteConfirmInput" placeholder="Type business name to confirm">
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeModal('deleteModal')">Cancel</button>
+      <button class="btn-danger" onclick="confirmDelete()">Delete Permanently</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '/api';
+let SECRET = '';
+let gyms = [];
+let pendingGym = null;
+
+function setError(msg) {
+  const el = document.getElementById('loginError');
+  el.textContent = msg;
+  el.style.display = msg ? 'block' : 'none';
+}
+
+async function login() {
+  const secret = document.getElementById('secretInput').value.trim();
+  if (!secret) return;
+  SECRET = secret;
+  setError('');
+  try {
+    const res = await fetch(`${API}/admin/gyms`, {
+      headers: { 'Authorization': `Bearer ${secret}`, 'Content-Type': 'application/json' }
+    });
+    if (res.status === 401) { setError('Invalid admin secret.'); SECRET=''; return; }
+    if (!res.ok) { setError('Server error. Try again.'); SECRET=''; return; }
+    const data = await res.json();
+    gyms = data.data.gyms || [];
+    document.getElementById('loginPage').style.display = 'none';
+    document.getElementById('dashboard').style.display = 'block';
+    renderTable(gyms);
+  } catch(e) {
+    setError('Connection failed. Check your network.');
+    SECRET = '';
+  }
+}
+
+function logout() {
+  SECRET = ''; gyms = [];
+  document.getElementById('loginPage').style.display = 'flex';
+  document.getElementById('dashboard').style.display = 'none';
+  document.getElementById('secretInput').value = '';
+}
+
+async function apiCall(method, path, body) {
+  const opts = { method, headers: { 'Authorization': `Bearer ${SECRET}`, 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(`${API}${path}`, opts);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+async function reload() {
+  const data = await apiCall('GET', '/admin/gyms');
+  gyms = data.data.gyms || [];
+  renderTable(gyms);
+}
+
+function statusBadge(g) {
+  if (g.is_blocked) return '<span class="badge badge-blocked">Blocked</span>';
+  if (g.subscription_status === 'trial') return `<span class="badge badge-trial">Trial (${g.days_remaining}d left)</span>`;
+  if (g.subscription_status === 'active') return `<span class="badge badge-active">Active (${g.days_remaining}d left)</span>`;
+  if (g.subscription_status === 'suspended') return '<span class="badge badge-suspended">Suspended</span>';
+  return `<span class="badge">${g.subscription_status}</span>`;
+}
+
+function actions(g) {
+  let btns = '';
+  if (g.is_blocked) {
+    btns += `<button class="action-btn btn-unblock" onclick="doUnblock('${g.id}')">Unblock</button>`;
+  } else {
+    if (g.subscription_status === 'suspended') {
+      btns += `<button class="action-btn btn-reactivate" onclick="doReactivate('${g.id}')">Reactivate</button>`;
+    } else {
+      btns += `<button class="action-btn btn-suspend" onclick="doSuspend('${g.id}')">Suspend</button>`;
+      btns += `<button class="action-btn btn-block" onclick="doBlock('${g.id}')">Block</button>`;
+    }
+    btns += `<button class="action-btn btn-activate" onclick="openActivate(${JSON.stringify(g)})">Activate</button>`;
+  }
+  btns += `<button class="action-btn btn-delete" onclick="openDelete(${JSON.stringify(g)})">Delete</button>`;
+  return btns;
+}
+
+function renderTable(data) {
+  const total = data.length;
+  const trial = data.filter(g => g.subscription_status==='trial' && !g.is_blocked).length;
+  const active = data.filter(g => g.subscription_status==='active' && !g.is_blocked).length;
+  const blocked = data.filter(g => g.is_blocked).length;
+  document.getElementById('statsBar').innerHTML =
+    `<span>Total: <b>${total}</b></span><span>Trial: <b>${trial}</b></span><span>Active: <b>${active}</b></span><span>Blocked: <b>${blocked}</b></span>`;
+
+  if (!data.length) {
+    document.getElementById('tableArea').innerHTML = '<div class="empty">No businesses found.</div>';
+    return;
+  }
+  let rows = data.map(g => `
+    <tr>
+      <td><b>${g.name}</b><br><span style="color:#888;font-size:12px">${g.owner_name}</span></td>
+      <td>${g.email}<br><span style="color:#888;font-size:12px">${g.phone}</span></td>
+      <td>${statusBadge(g)}</td>
+      <td style="color:#888;font-size:12px">${g.member_count} members<br>${new Date(g.created_at).toLocaleDateString('en-IN')}</td>
+      <td>${actions(g)}</td>
+    </tr>`).join('');
+  document.getElementById('tableArea').innerHTML = `
+    <table>
+      <thead><tr><th>Business</th><th>Contact</th><th>Status</th><th>Info</th><th>Actions</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function filterTable(q) {
+  q = q.toLowerCase();
+  const filtered = gyms.filter(g =>
+    g.name.toLowerCase().includes(q) || g.email.toLowerCase().includes(q) || g.owner_name.toLowerCase().includes(q)
+  );
+  renderTable(filtered);
+}
+
+async function doSuspend(id) {
+  if (!confirm('Suspend this business?')) return;
+  try { await apiCall('POST', `/admin/gyms/${id}/suspend`); await reload(); }
+  catch(e) { alert('Error: ' + e.message); }
+}
+
+async function doReactivate(id) {
+  try { await apiCall('POST', `/admin/gyms/${id}/reactivate`); await reload(); }
+  catch(e) { alert('Error: ' + e.message); }
+}
+
+async function doBlock(id) {
+  if (!confirm('Block this business? All logins will be rejected immediately.')) return;
+  try { await apiCall('POST', `/admin/gyms/${id}/block`); await reload(); }
+  catch(e) { alert('Error: ' + e.message); }
+}
+
+async function doUnblock(id) {
+  try { await apiCall('POST', `/admin/gyms/${id}/unblock`); await reload(); }
+  catch(e) { alert('Error: ' + e.message); }
+}
+
+function openActivate(g) {
+  pendingGym = g;
+  document.getElementById('activateModalName').textContent = `Activating subscription for: ${g.name}`;
+  document.getElementById('monthsInput').value = '1';
+  document.getElementById('activateModal').classList.add('show');
+}
+
+async function confirmActivate() {
+  const months = parseInt(document.getElementById('monthsInput').value) || 1;
+  try {
+    await apiCall('POST', `/admin/gyms/${pendingGym.id}/convert`, { months });
+    closeModal('activateModal');
+    await reload();
+  } catch(e) { alert('Error: ' + e.message); }
+}
+
+function openDelete(g) {
+  pendingGym = g;
+  document.getElementById('deleteModalDesc').textContent =
+    `This permanently deletes "${g.name}" and ALL its data — customers, staff, tasks, revenue. This cannot be undone.`;
+  document.getElementById('deleteConfirmInput').value = '';
+  document.getElementById('deleteModal').classList.add('show');
+}
+
+async function confirmDelete() {
+  const typed = document.getElementById('deleteConfirmInput').value.trim();
+  if (typed !== pendingGym.name) { alert('Business name does not match.'); return; }
+  try {
+    await apiCall('DELETE', `/admin/gyms/${pendingGym.id}`);
+    closeModal('deleteModal');
+    await reload();
+  } catch(e) { alert('Error: ' + e.message); }
+}
+
+function closeModal(id) {
+  document.getElementById(id).classList.remove('show');
+  pendingGym = null;
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeModal('activateModal'); closeModal('deleteModal'); }
+});
+</script>
+</body>
+</html>
