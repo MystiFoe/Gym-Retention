@@ -27,12 +27,14 @@ class User {
   final String businessId;
   final String role;
   final String trainerRole; // 'staff' | 'admin' — only relevant when role == 'trainer'
+  final String? memberId;   // only present when role == 'member'
 
   User({
     required this.id,
     required this.businessId,
     required this.role,
     this.trainerRole = 'staff',
+    this.memberId,
   });
 
   factory User.fromJson(Map<String, dynamic> json) {
@@ -41,6 +43,7 @@ class User {
       businessId:  json['gym_id']       ?? '',
       role:        json['role']         ?? '',
       trainerRole: json['trainer_role'] ?? 'staff',
+      memberId:    json['member_id'],
     );
   }
 }

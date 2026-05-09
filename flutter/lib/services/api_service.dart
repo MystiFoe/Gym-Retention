@@ -305,6 +305,27 @@ class ApiService {
   // CUSTOMER (MEMBER) AUTH
   // ============================================================================
 
+  Future<void> memberEmailLogin({
+    required String email,
+    required String password,
+  }) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/auth/login'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'phone_or_email': email,
+        'password':       password,
+        'role':           'member',
+      }),
+    );
+    final result = await _handleResponse(response, (data) => LoginResponse.fromJson(data));
+    await _saveTokens(result.accessToken, result.refreshToken);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('user_id',   result.user.memberId ?? result.user.id);
+    await prefs.setString('gym_id',    result.user.businessId);
+    await prefs.setString('user_role', 'member');
+  }
+
   Future<CustomerLoginResponse> customerLogin(String firebaseIdToken) async {
     final response = await http.post(
       Uri.parse('$baseUrl/auth/customer/login'),
