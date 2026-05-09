@@ -4706,6 +4706,93 @@ app.post('/api/auth/staff/register', async (req: Request, res: Response, next: N
   }
 });
 
+// POST /api/auth/member/register — member self-registration using invite code (public)
+app.post('/api/auth/member/register', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { code, name, email, phone, password } = req.body;
+    if (!code || !name || !email || !phone || !password) {
+      return res.status(400).json({ success: false, error: 'All fields are required' });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ success: false, error: 'Password must be at least 8 characters' });
+    }
+
+    const client = await pool.connect();
+    try {
+      // Validate invite code — must be a member invite
+      const inviteRes = await client.query(
+        `SELECT ic.*, g.id AS gym_id FROM invite_codes ic
+         JOIN gyms g ON ic.gym_id = g.id
+         WHERE ic.code = $1 AND ic.type = 'member' AND ic.used_at IS NULL AND ic.expires_at > NOW()`,
+        [code.toUpperCase()]
+      );
+      if (inviteRes.rows.length === 0) {
+        return res.status(400).json({ success: false, error: 'Invalid or expired invite code' });
+      }
+      const invite = inviteRes.rows[0];
+
+      // Check email not already registered in this gym
+      const emailCheck = await client.query(
+        `SELECT id FROM users WHERE gym_id = $1 AND phone_or_email = $2 AND is_deleted = false`,
+        [invite.gym_id, email]
+      );
+      if (emailCheck.rows.length > 0) {
+        return res.status(409).json({ success: false, error: 'Email already registered. Please log in instead.' });
+      }
+
+      await client.query('BEGIN');
+
+      const passwordHash = await bcrypt.hash(password, 10);
+      const userRes = await client.query(
+        `INSERT INTO users (gym_id, phone_or_email, password_hash, role)
+         VALUES ($1, $2, $3, 'member') RETURNING id, gym_id, role`,
+        [invite.gym_id, email, passwordHash]
+      );
+      const user = userRes.rows[0];
+
+      // Link user to existing member record and fill in their details
+      if (invite.member_id) {
+        await client.query(
+          `UPDATE members SET name = $1, phone = $2, email = $3 WHERE id = $4`,
+          [name, phone, email, invite.member_id]
+        );
+      }
+
+      // Mark invite used
+      await client.query(`UPDATE invite_codes SET used_at = NOW() WHERE id = $1`, [invite.id]);
+
+      await client.query('COMMIT');
+
+      const accessToken = jwt.sign(
+        { id: user.id, gym_id: user.gym_id, role: 'member' },
+        process.env.JWT_SECRET!,
+        { expiresIn: '1h' }
+      );
+      const refreshToken = jwt.sign(
+        { id: user.id, gym_id: user.gym_id },
+        process.env.JWT_REFRESH_SECRET!,
+        { expiresIn: '7d' }
+      );
+
+      res.status(201).json({
+        success: true,
+        data: {
+          accessToken,
+          refreshToken,
+          user: { id: user.id, gym_id: user.gym_id, role: 'member' },
+        }
+      });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    next(error);
+  }
+});
+
 // PUT /api/trainers/:id/role — promote or demote a trainer (owner only, not admin)
 app.put('/api/trainers/:id/role', authenticate, authorizeOwnerOnly, async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {

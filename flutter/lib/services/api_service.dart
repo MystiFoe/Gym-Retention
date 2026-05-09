@@ -283,11 +283,11 @@ class ApiService {
 
     final result = await _handleResponse(response, (data) => LoginResponse.fromJson(data));
     await _saveTokens(result.accessToken, result.refreshToken);
-    // Save user info for screens to use
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('user_id', result.user.id);
-    await prefs.setString('gym_id', result.user.businessId);
-    await prefs.setString('user_role', result.user.role);
+    await prefs.setString('user_id',      result.user.id);
+    await prefs.setString('gym_id',       result.user.businessId);
+    await prefs.setString('user_role',    result.user.role);
+    await prefs.setString('trainer_role', result.user.trainerRole);
     return result;
   }
 
@@ -299,6 +299,186 @@ class ApiService {
     _accessToken = null;
     _refreshToken = null;
     onAuthChanged?.call(false);
+  }
+
+  // ============================================================================
+  // CUSTOMER (MEMBER) AUTH
+  // ============================================================================
+
+  Future<CustomerLoginResponse> customerLogin(String firebaseIdToken) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/auth/customer/login'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'firebase_id_token': firebaseIdToken}),
+    );
+    return _handleResponse(response, (data) => CustomerLoginResponse.fromJson(data));
+  }
+
+  Future<CustomerLoginResponse> customerSelectGym(String firebaseIdToken, String memberId) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/auth/customer/select-gym'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'firebase_id_token': firebaseIdToken, 'member_id': memberId}),
+    );
+    return _handleResponse(response, (data) => CustomerLoginResponse.fromJson(data));
+  }
+
+  Future<void> saveCustomerSession(CustomerLoginResponse loginResp) async {
+    await _saveTokens(loginResp.accessToken, '');
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('user_id',   loginResp.memberId);
+    await prefs.setString('gym_id',    loginResp.gymId);
+    await prefs.setString('user_role', 'member');
+  }
+
+  // ============================================================================
+  // CUSTOMER PORTAL ENDPOINTS
+  // ============================================================================
+
+  Future<CustomerProfile> getCustomerProfile() async {
+    await loadTokens();
+    final response = await http.get(Uri.parse('$baseUrl/customer/profile'), headers: _getHeaders());
+    return _handleResponse(response, (data) => CustomerProfile.fromJson(data));
+  }
+
+  Future<void> updateCustomerProfile({required String name, required String email}) async {
+    await loadTokens();
+    final response = await http.put(
+      Uri.parse('$baseUrl/customer/profile'),
+      headers: _getHeaders(),
+      body: jsonEncode({'name': name, 'email': email}),
+    );
+    await _handleResponse(response, (data) => data);
+  }
+
+  Future<List<Map<String, dynamic>>> getMyAttendance({required int year, required int month}) async {
+    await loadTokens();
+    final uri = Uri.parse('$baseUrl/customer/attendance').replace(queryParameters: {
+      'year': '$year', 'month': '$month',
+    });
+    final response = await http.get(uri, headers: _getHeaders());
+    return _handleResponse(response, (data) => (data as List).cast<Map<String, dynamic>>());
+  }
+
+  Future<CustomerPaymentOrder> createPaymentOrder({required double amount, String? description}) async {
+    await loadTokens();
+    final response = await http.post(
+      Uri.parse('$baseUrl/payments/create-order'),
+      headers: _getHeaders(),
+      body: jsonEncode({'amount': amount, 'description': description}),
+    );
+    return _handleResponse(response, (data) => CustomerPaymentOrder.fromJson(data));
+  }
+
+  Future<void> verifyMemberPayment({
+    required String razorpayOrderId,
+    required String razorpayPaymentId,
+    required String razorpaySignature,
+  }) async {
+    await loadTokens();
+    final response = await http.post(
+      Uri.parse('$baseUrl/payments/verify'),
+      headers: _getHeaders(),
+      body: jsonEncode({
+        'razorpay_order_id':   razorpayOrderId,
+        'razorpay_payment_id': razorpayPaymentId,
+        'razorpay_signature':  razorpaySignature,
+      }),
+    );
+    await _handleResponse(response, (data) => data);
+  }
+
+  Future<PaymentsResponse> getCustomerPayments({int page = 1}) async {
+    await loadTokens();
+    final uri = Uri.parse('$baseUrl/customer/payments').replace(queryParameters: {'page': '$page'});
+    final response = await http.get(uri, headers: _getHeaders());
+    return _handleResponse(response, (data) => PaymentsResponse.fromJson(data));
+  }
+
+  Future<PaymentsResponse> getOwnerPayments({String? month, String? memberId, int page = 1}) async {
+    await loadTokens();
+    final params = <String, String>{'page': '$page'};
+    if (month != null)    params['month']     = month;
+    if (memberId != null) params['member_id'] = memberId;
+    final uri = Uri.parse('$baseUrl/payments').replace(queryParameters: params);
+    final response = await http.get(uri, headers: _getHeaders());
+    return _handleResponse(response, (data) => PaymentsResponse.fromJson(data));
+  }
+
+  Future<void> updateGymPaymentKeys({required String keyId, required String keySecret}) async {
+    await loadTokens();
+    final response = await http.get(Uri.parse('$baseUrl/profile'), headers: _getHeaders());
+    final profile = await _handleResponse(response, (data) => UserProfile.fromJson(data));
+    final gymRes = await http.put(
+      Uri.parse('$baseUrl/gyms/me'),
+      headers: _getHeaders(),
+      body: jsonEncode({
+        'gymName': profile.gym?.name ?? '',
+        'razorpay_key_id':     keyId,
+        'razorpay_key_secret': keySecret,
+      }),
+    );
+    await _handleResponse(gymRes, (data) => data);
+  }
+
+  // ============================================================================
+  // BIOMETRIC / QR ATTENDANCE ENDPOINTS
+  // ============================================================================
+
+  Future<List<Map<String, dynamic>>> getBiometricDevices() async {
+    await loadTokens();
+    final response = await http.get(Uri.parse('$baseUrl/biometric/devices'), headers: _getHeaders());
+    return _handleResponse(response, (data) => (data as List).cast<Map<String, dynamic>>());
+  }
+
+  Future<Map<String, dynamic>> registerBiometricDevice({required String serialNumber, String? deviceName}) async {
+    await loadTokens();
+    final response = await http.post(
+      Uri.parse('$baseUrl/biometric/devices'),
+      headers: _getHeaders(),
+      body: jsonEncode({'serial_number': serialNumber, 'device_name': deviceName}),
+    );
+    return _handleResponse(response, (data) => data as Map<String, dynamic>);
+  }
+
+  Future<void> deleteBiometricDevice(String deviceId) async {
+    await loadTokens();
+    final response = await http.delete(Uri.parse('$baseUrl/biometric/devices/$deviceId'), headers: _getHeaders());
+    await _handleResponse(response, (data) => data);
+  }
+
+  Future<List<Map<String, dynamic>>> getBiometricMappings({String? serial}) async {
+    await loadTokens();
+    final uri = Uri.parse('$baseUrl/biometric/mappings')
+        .replace(queryParameters: serial != null ? {'serial': serial} : null);
+    final response = await http.get(uri, headers: _getHeaders());
+    return _handleResponse(response, (data) => (data as List).cast<Map<String, dynamic>>());
+  }
+
+  Future<void> saveBiometricMapping({required String serialNumber, required String deviceUserId, String? memberId}) async {
+    await loadTokens();
+    final response = await http.put(
+      Uri.parse('$baseUrl/biometric/mappings'),
+      headers: _getHeaders(),
+      body: jsonEncode({'serial_number': serialNumber, 'device_user_id': deviceUserId, 'member_id': memberId}),
+    );
+    await _handleResponse(response, (data) => data);
+  }
+
+  Future<Map<String, dynamic>> markQrAttendance(String memberId) async {
+    await loadTokens();
+    final response = await http.post(
+      Uri.parse('$baseUrl/attendance/qr'),
+      headers: _getHeaders(),
+      body: jsonEncode({'member_id': memberId}),
+    );
+    return _handleResponse(response, (data) => data as Map<String, dynamic>);
+  }
+
+  Future<Map<String, dynamic>> selfCheckIn() async {
+    await loadTokens();
+    final response = await http.post(Uri.parse('$baseUrl/attendance/checkin'), headers: _getHeaders());
+    return _handleResponse(response, (data) => data as Map<String, dynamic>);
   }
 
   // ============================================================================
@@ -347,17 +527,32 @@ class ApiService {
     required String gymName,
     String? address,
     String? phone,
+    String? razorpayKeyId,
+    String? razorpayKeySecret,
   }) async {
+    await loadTokens();
+    final body = <String, dynamic>{'gymName': gymName};
+    if (address != null) body['address'] = address;
+    if (phone != null && phone.isNotEmpty) body['phone'] = phone;
+    if (razorpayKeyId != null && razorpayKeyId.isNotEmpty) body['razorpay_key_id'] = razorpayKeyId;
+    if (razorpayKeySecret != null && razorpayKeySecret.isNotEmpty) body['razorpay_key_secret'] = razorpayKeySecret;
     final response = await http.put(
       Uri.parse('$baseUrl/gyms/me'),
       headers: _getHeaders(),
-      body: jsonEncode({
-        'gymName': gymName,
-        'address': ?address,
-        if (phone != null && phone.isNotEmpty) 'phone': phone,
-      }),
+      body: jsonEncode(body),
     );
-    _handleResponse(response, (data) => data);
+    await _handleResponse(response, (data) => data);
+  }
+
+  Future<String> downloadPaymentReport({required String month}) async {
+    await loadTokens();
+    final uri = Uri.parse('$baseUrl/payments/report').replace(queryParameters: {'month': month});
+    final response = await http.get(uri, headers: _getHeaders());
+    if (response.statusCode >= 400) {
+      final body = jsonDecode(response.body);
+      throw Exception(body['error'] ?? 'Download failed');
+    }
+    return response.body;
   }
 
   Future<void> forgotPassword({required String email}) async {
@@ -613,6 +808,7 @@ class ApiService {
     String? lastVisitDate,
     required String subscriptionEndDate,
     required double planFee,
+    required String plan,
     String? assignedStaffId,
   }) async {
     final response = await http.post(
@@ -622,10 +818,11 @@ class ApiService {
         'name': name,
         'phone': phone,
         if (email != null && email.isNotEmpty) 'email': email,
-        'last_visit_date': ?lastVisitDate,
+        'last_visit_date': lastVisitDate,
         'membership_expiry_date': subscriptionEndDate,
         'plan_fee': planFee,
-        'assigned_trainer_id': ?assignedStaffId,
+        'plan': plan,
+        'assigned_trainer_id': assignedStaffId,
       }),
     );
     return _handleResponse(response, (data) => Customer.fromJson(data));
@@ -638,6 +835,7 @@ class ApiService {
     required String email,
     required String subscriptionEndDate,
     required double planFee,
+    required String plan,
     required String staffId,
   }) async {
     final response = await http.put(
@@ -649,6 +847,7 @@ class ApiService {
         'email': email,
         'membership_expiry_date': subscriptionEndDate,
         'plan_fee': planFee,
+        'plan': plan,
         'assigned_trainer_id': staffId,
       }),
     );
@@ -710,6 +909,117 @@ class ApiService {
       'failed':   totalFailed,
       'errors':   allErrors,
     };
+  }
+
+  // ============================================================================
+  // INVITE CODE ENDPOINTS
+  // ============================================================================
+
+  Future<InviteCodeResult> generateInvite({
+    required String type, // 'staff' | 'member'
+    String? name,
+    String? phone,
+    String trainerRole = 'staff',
+  }) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/invites'),
+      headers: _getHeaders(),
+      body: jsonEncode({
+        'type': type,
+        'name': name,
+        'phone': phone,
+        if (type == 'staff') 'trainer_role': trainerRole,
+      }),
+    );
+    return _handleResponse(response, (data) => InviteCodeResult.fromJson(data));
+  }
+
+  Future<InviteCodeInfo> validateInviteCode(String code) async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/invites/${code.toUpperCase()}'),
+      headers: {'Content-Type': 'application/json'},
+    );
+    return _handleResponse(response, (data) => InviteCodeInfo.fromJson(data));
+  }
+
+  Future<LoginResponse> staffSelfRegister({
+    required String code,
+    required String name,
+    required String email,
+    required String phone,
+    required String password,
+  }) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/auth/staff/register'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'code': code.toUpperCase(),
+        'name': name,
+        'email': email,
+        'phone': phone,
+        'password': password,
+      }),
+    );
+    final result = await _handleResponse(response, (data) => LoginResponse.fromJson(data));
+    await _saveTokens(result.accessToken, result.refreshToken);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('user_id',      result.user.id);
+    await prefs.setString('gym_id',       result.user.businessId);
+    await prefs.setString('user_role',    result.user.role);
+    await prefs.setString('trainer_role', result.user.trainerRole);
+    return result;
+  }
+
+  Future<LoginResponse> memberSelfRegister({
+    required String code,
+    required String name,
+    required String email,
+    required String phone,
+    required String password,
+  }) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/auth/member/register'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'code': code.toUpperCase(),
+        'name': name,
+        'email': email,
+        'phone': phone,
+        'password': password,
+      }),
+    );
+    final result = await _handleResponse(response, (data) => LoginResponse.fromJson(data));
+    await _saveTokens(result.accessToken, result.refreshToken);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('user_id',   result.user.id);
+    await prefs.setString('gym_id',    result.user.businessId);
+    await prefs.setString('user_role', 'member');
+    return result;
+  }
+
+  Future<void> promoteStaff(String staffId, String trainerRole) async {
+    final response = await http.put(
+      Uri.parse('$baseUrl/trainers/$staffId/role'),
+      headers: _getHeaders(),
+      body: jsonEncode({'trainer_role': trainerRole}),
+    );
+    await _handleResponse(response, (_) => null);
+  }
+
+  // Link a member account via invite code (called when phone OTP login returns 404)
+  Future<CustomerLoginResponse> memberLinkInvite({
+    required String firebaseIdToken,
+    required String code,
+  }) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/auth/customer/link-invite'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'firebase_id_token': firebaseIdToken,
+        'code': code.toUpperCase(),
+      }),
+    );
+    return _handleResponse(response, (data) => CustomerLoginResponse.fromJson(data));
   }
 
   // ============================================================================

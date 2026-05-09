@@ -5,6 +5,7 @@ import 'package:gym_fitness_app/utils/app_routes.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import '../services/api_service.dart';
 import '../utils/error_helper.dart';
+import '../main.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -62,7 +63,10 @@ class _LoginScreenState extends State<LoginScreen> {
       }
 
       if (mounted) {
-        if (selectedRole == 'owner') {
+        if (selectedRole == 'member') {
+          authNotifier.update(true, role: 'member');
+          context.go(RoutePaths.memberDashboard);
+        } else if (selectedRole == 'owner') {
           AppRoutes.pushAndRemoveUntil(RouteNames.ownerDashboard);
         } else if (selectedRole == 'trainer') {
           AppRoutes.pushAndRemoveUntil(RouteNames.trainerDashboard);
@@ -190,6 +194,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 items: const [
                   DropdownMenuItem(value: 'owner', child: Text('Business Owner')),
                   DropdownMenuItem(value: 'trainer', child: Text('Staff')),
+                  DropdownMenuItem(value: 'member', child: Text('Member')),
                 ],
                 onChanged: (value) {
                   setState(() => selectedRole = value ?? 'owner');
@@ -285,6 +290,51 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                   ),
                 ],
+              ),
+              const SizedBox(height: 24),
+              Row(
+                children: [
+                  const Expanded(child: Divider()),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    child: Text('Are you a gym member?', style: TextStyle(color: Colors.grey[500], fontSize: 13)),
+                  ),
+                  const Expanded(child: Divider()),
+                ],
+              ),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                height: 52,
+                child: OutlinedButton.icon(
+                  onPressed: () => context.push('/customer/login'),
+                  icon: const Icon(Icons.fitness_center, color: Color(0xFF4CAF50)),
+                  label: const Text(
+                    'Member Login',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Color(0xFF4CAF50)),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    side: const BorderSide(color: Color(0xFF4CAF50)),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                height: 52,
+                child: OutlinedButton.icon(
+                  onPressed: () => context.push('/staff/register'),
+                  icon: const Icon(Icons.badge_outlined, color: Color(0xFF9C27B0)),
+                  label: const Text(
+                    'Register with Invite Code',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Color(0xFF9C27B0)),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    side: const BorderSide(color: Color(0xFF9C27B0)),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                ),
               ),
             ],
           ),
