@@ -4,950 +4,449 @@ const spec = swaggerJsdoc({
   definition: {
     openapi: '3.0.3',
     info: {
-      title: 'Recurva API',
-      version: '2.0.0',
+      title: 'Recurva Gym Retention API',
+      version: '3.0.0',
       description: `
 **Customer retention platform for gyms** — multi-tenant SaaS with three roles.
 
 ## Roles
-| Role | Token | Expiry | Notes |
-|------|-------|--------|-------|
-| \`owner\` | JWT (access + refresh) | 1h / 7d | Full access |
-| \`trainer\` (staff) | JWT (access + refresh) | 1h / 7d | Access to assigned customers only |
-| \`trainer\` (admin) | JWT with \`trainer_role: "admin"\` | 1h / 7d | Same access as owner except subscription/billing |
-| \`member\` | JWT (access only — phone OTP) | 30d | Own profile, attendance, payments |
+| Role | Access |
+|------|--------|
+| \`owner\` | Full gym management, billing, subscriptions |
+| \`trainer\` (staff) | Member attendance, tasks, assigned members |
+| \`trainer\` (admin) | Same as owner except billing/subscription |
+| \`member\` | Own attendance, payments, profile |
 
-## ID Format
-All entities have globally-unique display IDs generated on creation:
+## Authentication Flow
+- **Owner/Staff login**: \`POST /api/auth/login\` with email + password + role
+- **Member login**: \`POST /api/auth/login\` with email + password + role=member
+- **Token refresh**: \`POST /api/auth/refresh\` — supply refresh_token, get new pair
+- **Phone OTP login** (owner/staff only): Firebase phone OTP → \`POST /api/auth/verify-firebase\`
+
+## Staff & Member Onboarding
+1. Owner generates invite code via \`POST /api/invite-codes\`
+2. Shares 8-char code with person
+3. Person calls \`POST /api/auth/staff/register\` or \`POST /api/auth/member/register\`
+
+## Member Registration with Verification
+1. \`POST /api/auth/member/send-email-otp\` — validate invite, send OTP to email
+2. Client does Firebase phone OTP verification (gets firebaseIdToken)
+3. \`POST /api/auth/member/register\` — with emailOtpKey, emailOtp, firebaseIdToken
+
+## Display ID Format
 - Business: \`RCV-B-XXXXX\`
 - Staff/Admin: \`RCV-S-XXXXXXX\`
 - Member: \`RCV-M-XXXXXXX\`
 
-## Staff/Member Onboarding
-Owner generates an invite code → shares 8-char code → person self-registers with own credentials.
-
-## How to authenticate
-1. Call the relevant login endpoint.
-2. Click **Authorize** (🔒) and enter: \`Bearer <access_token>\`.
-
-## Admin endpoints
-Use \`Authorization: Bearer <ADMIN_SECRET>\` (value from server \`.env\`).
-      `.trim(),
+## Error Responses
+All errors follow: \`{ "success": false, "error": "message" }\`
+`,
+      contact: { name: 'Recurva Support', email: 'support@recurva.app' },
     },
     servers: [
-      { url: 'https://recurva.in', description: 'Production' },
-      { url: 'http://localhost:3000', description: 'Local development' },
+      { url: 'https://api-mbnwf5sqva-el.a.run.app/api', description: 'Production (Firebase Cloud Run)' },
+      { url: 'http://localhost:3000/api', description: 'Local development' },
     ],
     components: {
       securitySchemes: {
-        BearerAuth: {
+        bearerAuth: {
           type: 'http',
           scheme: 'bearer',
           bearerFormat: 'JWT',
-          description: 'Bearer token from login endpoint',
-        },
-        AdminSecret: {
-          type: 'http',
-          scheme: 'bearer',
-          description: 'Static ADMIN_SECRET (not a JWT)',
+          description: 'Access token obtained from login or register endpoints',
         },
       },
       schemas: {
-        Uuid: { type: 'string', format: 'uuid', example: '550e8400-e29b-41d4-a716-446655440000' },
-        Error: {
+        // ── Common ──────────────────────────────────────────────────────────
+        SuccessResponse: {
+          type: 'object',
+          properties: {
+            success: { type: 'boolean', example: true },
+            data: { type: 'object' },
+          },
+        },
+        ErrorResponse: {
           type: 'object',
           properties: {
             success: { type: 'boolean', example: false },
-            error: { type: 'string', example: 'Human-readable error message' },
+            error: { type: 'string', example: 'Invalid credentials' },
           },
         },
-        TokenPair: {
+        // ── Auth ────────────────────────────────────────────────────────────
+        LoginRequest: {
+          type: 'object',
+          required: ['phone_or_email', 'password', 'role'],
+          properties: {
+            phone_or_email: { type: 'string', example: 'owner@gym.com' },
+            password: { type: 'string', format: 'password', example: 'Secret@123' },
+            role: { type: 'string', enum: ['owner', 'trainer', 'member'] },
+            gym_id: { type: 'string', format: 'uuid', description: 'Optional — disambiguates when user belongs to multiple gyms' },
+          },
+        },
+        LoginResponse: {
           type: 'object',
           properties: {
-            access_token:  { type: 'string' },
-            refresh_token: { type: 'string' },
-            user: {
+            success: { type: 'boolean', example: true },
+            data: {
               type: 'object',
               properties: {
-                id:           { $ref: '#/components/schemas/Uuid' },
-                gym_id:       { $ref: '#/components/schemas/Uuid' },
-                role:         { type: 'string', enum: ['owner', 'trainer'] },
-                trainer_role: { type: 'string', enum: ['staff', 'admin'], description: 'Only present when role=trainer' },
+                accessToken: { type: 'string' },
+                refreshToken: { type: 'string' },
+                user: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'string', format: 'uuid' },
+                    gym_id: { type: 'string', format: 'uuid' },
+                    role: { type: 'string', enum: ['owner', 'trainer', 'member'] },
+                    trainer_role: { type: 'string', enum: ['staff', 'admin'], description: 'Only for trainer role' },
+                    member_id: { type: 'string', format: 'uuid', description: 'Only for member role' },
+                  },
+                },
               },
             },
           },
         },
-        InviteCode: {
+        // ── Gym ─────────────────────────────────────────────────────────────
+        Gym: {
           type: 'object',
           properties: {
-            code:             { type: 'string', example: 'A7K3MP2Q', description: '8-char uppercase alphanumeric, single-use, 7-day expiry' },
-            display_id:       { type: 'string', example: 'RCV-S-0000001', description: 'Pre-assigned unique ID for the new person' },
-            type:             { type: 'string', enum: ['staff', 'member'] },
-            trainer_role:     { type: 'string', enum: ['staff', 'admin'], nullable: true },
-            expires_in_days:  { type: 'integer', example: 7 },
-            placeholder_name: { type: 'string', nullable: true, description: 'Optional name hint set by owner' },
+            id: { type: 'string', format: 'uuid' },
+            name: { type: 'string', example: 'FitZone Gym' },
+            email: { type: 'string', format: 'email' },
+            phone: { type: 'string', example: '+919876543210' },
+            address: { type: 'string' },
+            display_id: { type: 'string', example: 'RCV-B-00001' },
+            subscription_status: { type: 'string', enum: ['trial', 'active', 'suspended', 'cancelled'] },
+            created_at: { type: 'string', format: 'date-time' },
           },
         },
-        InviteCodeInfo: {
-          type: 'object',
-          description: 'Public info returned when validating an invite code',
-          properties: {
-            code:             { type: 'string' },
-            type:             { type: 'string', enum: ['staff', 'member'] },
-            display_id:       { type: 'string' },
-            trainer_role:     { type: 'string', nullable: true },
-            gym_name:         { type: 'string' },
-            placeholder_name: { type: 'string', nullable: true },
-          },
-        },
-        MemberToken: {
-          type: 'object',
-          properties: {
-            access_token: { type: 'string', description: '30-day JWT — no refresh token' },
-            member: {
-              type: 'object',
-              properties: {
-                id:       { $ref: '#/components/schemas/Uuid' },
-                name:     { type: 'string' },
-                gym_id:   { $ref: '#/components/schemas/Uuid' },
-                gym_name: { type: 'string' },
-                role:     { type: 'string', enum: ['member'] },
-              },
-            },
-          },
-        },
+        // ── Member ──────────────────────────────────────────────────────────
         Member: {
           type: 'object',
           properties: {
-            id:                     { $ref: '#/components/schemas/Uuid' },
-            name:                   { type: 'string', example: 'Kishore R' },
-            phone:                  { type: 'string', example: '8783463233' },
-            email:                  { type: 'string', format: 'email' },
-            status:                 { type: 'string', enum: ['active', 'at_risk', 'high_risk'] },
-            last_visit_date:        { type: 'string', format: 'date', nullable: true },
+            id: { type: 'string', format: 'uuid' },
+            name: { type: 'string', example: 'Rahul Kumar' },
+            phone: { type: 'string', example: '+919876543210' },
+            email: { type: 'string', format: 'email' },
+            display_id: { type: 'string', example: 'RCV-M-0001234' },
+            status: { type: 'string', enum: ['active', 'at_risk', 'high_risk'] },
+            plan: { type: 'string', example: 'monthly' },
+            plan_fee: { type: 'number', example: 1500 },
             membership_expiry_date: { type: 'string', format: 'date' },
-            plan_fee:               { type: 'number', example: 7462 },
-            created_at:             { type: 'string', format: 'date-time' },
-            assigned_trainer_id:    { $ref: '#/components/schemas/Uuid', nullable: true },
+            last_visit_date: { type: 'string', format: 'date', nullable: true },
+            email_verified: { type: 'boolean' },
+            phone_verified: { type: 'boolean' },
+            created_at: { type: 'string', format: 'date-time' },
           },
         },
+        MemberInput: {
+          type: 'object',
+          required: ['name', 'phone', 'membership_expiry_date'],
+          properties: {
+            name: { type: 'string', minLength: 2, example: 'Rahul Kumar' },
+            phone: { type: 'string', example: '+919876543210' },
+            email: { type: 'string', format: 'email' },
+            plan: { type: 'string', example: 'monthly' },
+            plan_fee: { type: 'number', example: 1500 },
+            membership_expiry_date: { type: 'string', format: 'date', example: '2026-06-30' },
+          },
+        },
+        // ── Trainer ─────────────────────────────────────────────────────────
         Trainer: {
           type: 'object',
           properties: {
-            id:                     { $ref: '#/components/schemas/Uuid' },
-            name:                   { type: 'string' },
-            phone:                  { type: 'string' },
-            email:                  { type: 'string', format: 'email' },
-            assigned_members_count: { type: 'integer' },
-            is_active:              { type: 'boolean' },
-            created_at:             { type: 'string', format: 'date-time' },
-            login_email:            { type: 'string', format: 'email', description: 'Email used to log in (may differ from contact email)' },
+            id: { type: 'string', format: 'uuid' },
+            name: { type: 'string' },
+            phone: { type: 'string' },
+            email: { type: 'string', format: 'email' },
+            display_id: { type: 'string', example: 'RCV-S-0000001' },
+            trainer_role: { type: 'string', enum: ['staff', 'admin'] },
+            is_active: { type: 'boolean' },
+            created_at: { type: 'string', format: 'date-time' },
           },
         },
-        Task: {
+        // ── Attendance ──────────────────────────────────────────────────────
+        AttendanceRecord: {
           type: 'object',
           properties: {
-            id:                  { $ref: '#/components/schemas/Uuid' },
-            member_id:           { $ref: '#/components/schemas/Uuid' },
-            task_type:           { type: 'string', enum: ['call', 'renewal', 'check_in'] },
-            status:              { type: 'string', enum: ['pending', 'completed'] },
-            outcome:             { type: 'string', enum: ['called','not_reachable','coming_tomorrow','renewed','no_action'], nullable: true },
-            notes:               { type: 'string', nullable: true },
-            created_at:          { type: 'string', format: 'date-time' },
-            completed_at:        { type: 'string', format: 'date-time', nullable: true },
-            assigned_trainer_id: { $ref: '#/components/schemas/Uuid', nullable: true },
-            member_name:         { type: 'string' },
-            member_phone:        { type: 'string' },
-            trainer_name:        { type: 'string', nullable: true },
+            id: { type: 'string', format: 'uuid' },
+            member_id: { type: 'string', format: 'uuid' },
+            visit_date: { type: 'string', format: 'date' },
+            check_in_time: { type: 'string', format: 'time', nullable: true },
+            source: { type: 'string', enum: ['staff', 'mobile', 'biometric', 'qr'] },
+            created_at: { type: 'string', format: 'date-time' },
           },
         },
+        // ── Payment ─────────────────────────────────────────────────────────
         Payment: {
           type: 'object',
           properties: {
-            id:             { $ref: '#/components/schemas/Uuid' },
-            amount:         { type: 'integer', description: 'Paise (₹1 = 100 paise)', example: 746200 },
-            currency:       { type: 'string', example: 'INR' },
-            status:         { type: 'string', enum: ['pending', 'completed', 'failed'] },
-            payment_method: { type: 'string', nullable: true, example: 'upi' },
-            description:    { type: 'string', nullable: true },
-            created_at:     { type: 'string', format: 'date-time' },
-            member_name:    { type: 'string', description: 'Owner-view only' },
-            member_phone:   { type: 'string', description: 'Owner-view only' },
+            id: { type: 'string', format: 'uuid' },
+            member_id: { type: 'string', format: 'uuid' },
+            amount: { type: 'integer', description: 'Amount in paise (₹1 = 100 paise)', example: 150000 },
+            currency: { type: 'string', example: 'INR' },
+            status: { type: 'string', enum: ['pending', 'completed', 'failed'] },
+            razorpay_order_id: { type: 'string' },
+            razorpay_payment_id: { type: 'string' },
+            description: { type: 'string', nullable: true },
+            created_at: { type: 'string', format: 'date-time' },
           },
         },
+        // ── Invite Code ─────────────────────────────────────────────────────
+        InviteCode: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', format: 'uuid' },
+            code: { type: 'string', example: 'ABCD1234', minLength: 8, maxLength: 8 },
+            type: { type: 'string', enum: ['staff', 'member'] },
+            trainer_role: { type: 'string', enum: ['staff', 'admin'], nullable: true },
+            gym_name: { type: 'string' },
+            display_id: { type: 'string' },
+            placeholder_name: { type: 'string', nullable: true },
+            expires_at: { type: 'string', format: 'date-time' },
+            used_at: { type: 'string', format: 'date-time', nullable: true },
+            created_at: { type: 'string', format: 'date-time' },
+          },
+        },
+        // ── Customer Profile (member self-view) ──────────────────────────────
         CustomerProfile: {
           type: 'object',
           properties: {
-            id:                     { $ref: '#/components/schemas/Uuid' },
-            name:                   { type: 'string' },
-            phone:                  { type: 'string' },
-            email:                  { type: 'string', format: 'email' },
-            status:                 { type: 'string', enum: ['active', 'at_risk', 'high_risk'] },
-            last_visit_date:        { type: 'string', format: 'date', nullable: true },
+            id: { type: 'string', format: 'uuid' },
+            name: { type: 'string' },
+            phone: { type: 'string' },
+            email: { type: 'string', format: 'email' },
+            status: { type: 'string', enum: ['active', 'at_risk', 'high_risk'] },
+            plan: { type: 'string' },
+            plan_fee: { type: 'number' },
             membership_expiry_date: { type: 'string', format: 'date' },
-            plan_fee:               { type: 'number' },
-            created_at:             { type: 'string', format: 'date-time' },
-            gym_name:               { type: 'string' },
-            gym_address:            { type: 'string' },
-            gym_phone:              { type: 'string' },
-            payment_enabled:        { type: 'boolean', description: 'True when gym owner has set Razorpay keys' },
+            last_visit_date: { type: 'string', format: 'date', nullable: true },
+            email_verified: { type: 'boolean' },
+            phone_verified: { type: 'boolean' },
+            gym_name: { type: 'string' },
+            gym_address: { type: 'string' },
+            gym_phone: { type: 'string' },
+            payment_enabled: { type: 'boolean' },
+          },
+        },
+        // ── Task ────────────────────────────────────────────────────────────
+        Task: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', format: 'uuid' },
+            member_id: { type: 'string', format: 'uuid' },
+            task_type: { type: 'string', enum: ['call', 'renewal', 'check_in'] },
+            status: { type: 'string', enum: ['pending', 'completed', 'cancelled'] },
+            assigned_trainer_id: { type: 'string', format: 'uuid', nullable: true },
+            notes: { type: 'string', nullable: true },
+            outcome: { type: 'string', nullable: true },
+            created_at: { type: 'string', format: 'date-time' },
+            completed_at: { type: 'string', format: 'date-time', nullable: true },
           },
         },
       },
     },
-
-    security: [{ BearerAuth: [] }],
-
+    security: [{ bearerAuth: [] }],
     tags: [
-      { name: 'System',          description: 'Health check' },
-      { name: 'Registration',    description: '3-step gym onboarding (email OTP → phone OTP)' },
-      { name: 'Auth',            description: 'Login, token refresh, password reset' },
-      { name: 'Members',         description: 'Customer CRUD, export, GDPR erase' },
-      { name: 'Trainers',        description: 'Staff CRUD, member assignment' },
-      { name: 'Tasks',           description: 'Follow-up task management' },
-      { name: 'Attendance',      description: 'Visit marking and history' },
-      { name: 'Profile',         description: 'User and gym settings (owner / trainer)' },
-      { name: 'Customer Portal', description: 'Self-service portal for members (role: member)' },
-      { name: 'Payments',        description: 'Razorpay gym membership payments (create → verify → history)' },
-      { name: 'Subscription',    description: 'Recurva platform billing (owner pays Recurva)' },
-      { name: 'Dashboard',       description: 'KPIs and revenue metrics' },
-      { name: 'Admin',           description: 'Super-admin operations (ADMIN_SECRET)' },
+      { name: 'Auth', description: 'Authentication — login, register, refresh, OTP' },
+      { name: 'Gym Registration', description: 'Business / gym self-registration flow' },
+      { name: 'Gyms', description: 'Gym profile & subscription management' },
+      { name: 'Members', description: 'Owner/trainer member CRUD' },
+      { name: 'Trainers', description: 'Owner trainer management' },
+      { name: 'Attendance', description: 'Mark & view attendance' },
+      { name: 'Tasks', description: 'Follow-up task management' },
+      { name: 'Invite Codes', description: 'Invite code generation & validation' },
+      { name: 'Payments (Owner)', description: 'Owner payment history & Razorpay setup' },
+      { name: 'Payments (Member)', description: 'Member payment portal' },
+      { name: 'Member Portal', description: 'Self-service endpoints for logged-in members' },
+      { name: 'Biometric', description: 'ZKTeco biometric device integration' },
+      { name: 'Profile', description: 'Logged-in user profile' },
+      { name: 'Admin', description: 'Super-admin platform management' },
     ],
-
     paths: {
-      // ── System ────────────────────────────────────────────────────────────────
-      '/health': {
-        get: {
-          tags: ['System'],
-          summary: 'Health check',
-          security: [],
-          responses: {
-            200: { description: 'Server is up', content: { 'application/json': { schema: { type: 'object', properties: { status: { type: 'string', example: 'ok' }, uptime: { type: 'number' } } } } } },
-          },
-        },
-      },
-
-      // ── Registration ─────────────────────────────────────────────────────────
-      '/api/gyms/register': {
-        post: {
-          tags: ['Registration'],
-          summary: 'Step 1 — Submit gym details (sends email OTP)',
-          security: [],
-          requestBody: {
-            required: true,
-            content: { 'application/json': { schema: { type: 'object', required: ['gym_name','owner_name','phone','email','owner_password','owner_email'], properties: {
-              gym_name:       { type: 'string', minLength: 2, maxLength: 100 },
-              owner_name:     { type: 'string', minLength: 2 },
-              phone:          { type: 'string', example: '9876543210' },
-              email:          { type: 'string', format: 'email', description: 'Gym public email' },
-              address:        { type: 'string' },
-              owner_password: { type: 'string', minLength: 8, description: 'Uppercase + digit + special character required' },
-              owner_email:    { type: 'string', format: 'email', description: 'Login email for the owner' },
-            } } } },
-          },
-          responses: {
-            201: { description: 'Pending registration created; OTP sent to owner_email', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { pendingId: { type: 'string' }, ownerEmail: { type: 'string' }, gymPhone: { type: 'string' } } } } } } } },
-            409: { description: 'Email already registered', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
-          },
-        },
-      },
-      '/api/gyms/register/verify-email': {
-        post: {
-          tags: ['Registration'],
-          summary: 'Step 2 — Verify email OTP',
-          security: [],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['pending_id','otp_code'], properties: { pending_id: { type: 'string', format: 'uuid' }, otp_code: { type: 'string', minLength: 6, maxLength: 6, example: '482910' } } } } } },
-          responses: {
-            200: { description: 'Email verified; send Firebase phone OTP next' },
-            400: { description: 'Invalid or expired OTP', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
-          },
-        },
-      },
-      '/api/gyms/register/resend-email-otp': {
-        post: {
-          tags: ['Registration'],
-          summary: 'Resend email OTP',
-          security: [],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['pending_id'], properties: { pending_id: { type: 'string', format: 'uuid' } } } } } },
-          responses: { 200: { description: 'OTP resent' } },
-        },
-      },
-      '/api/gyms/register/verify-phone': {
-        post: {
-          tags: ['Registration'],
-          summary: 'Step 3 — Verify phone via Firebase; completes registration',
-          description: 'Creates the gym + owner user, starts 30-day trial, returns JWT.',
-          security: [],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['pending_id','firebase_id_token'], properties: { pending_id: { type: 'string', format: 'uuid' }, firebase_id_token: { type: 'string' } } } } } },
-          responses: {
-            201: { description: 'Gym created, tokens issued', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/TokenPair' } } } } } },
-          },
-        },
-      },
-
-      // ── Auth ─────────────────────────────────────────────────────────────────
-      '/api/auth/login': {
+      // ════════════════════════════════════════════════════════════════════
+      // AUTH
+      // ════════════════════════════════════════════════════════════════════
+      '/auth/login': {
         post: {
           tags: ['Auth'],
-          summary: 'Email/phone + password login (owner or trainer)',
+          summary: 'Login with email/phone + password',
+          description: 'Authenticates owner, trainer, or member. Returns access + refresh tokens. For members, also returns member_id in the token payload.',
           security: [],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['phone_or_email','password','role'], properties: {
-            phone_or_email: { type: 'string', example: 'owner@gym.com' },
-            password:       { type: 'string', example: 'Giri@123' },
-            role:           { type: 'string', enum: ['owner','trainer'] },
-            gym_id:         { type: 'string', format: 'uuid', description: 'Required when the same email is used across multiple gyms' },
-          } } } } },
+          requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/LoginRequest' } } } },
           responses: {
-            200: { description: 'Login successful', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/TokenPair' } } } } } },
-            401: { description: 'Wrong password or user not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
-            403: { description: 'Gym blocked', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
+            200: { description: 'Login successful', content: { 'application/json': { schema: { $ref: '#/components/schemas/LoginResponse' } } } },
+            401: { description: 'Invalid credentials', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+            403: { description: 'Account blocked or suspended' },
           },
         },
       },
-      '/api/auth/refresh': {
+      '/auth/refresh': {
         post: {
           tags: ['Auth'],
           summary: 'Refresh access token',
           security: [],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['refresh_token'], properties: { refresh_token: { type: 'string' } } } } } },
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { type: 'object', required: ['refresh_token'], properties: { refresh_token: { type: 'string' } } } } },
+          },
           responses: {
-            200: { description: 'New token pair', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { access_token: { type: 'string' }, refresh_token: { type: 'string' } } } } } } } },
-            401: { description: 'Invalid or expired refresh token', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
+            200: { description: 'New token pair issued', content: { 'application/json': { schema: { $ref: '#/components/schemas/LoginResponse' } } } },
+            401: { description: 'Invalid or expired refresh token' },
           },
         },
       },
-      '/api/auth/verify-firebase-token': {
+      '/auth/logout': {
         post: {
           tags: ['Auth'],
-          summary: 'Phone OTP login (owner or trainer)',
+          summary: 'Logout (client-side token discard)',
+          description: 'No server-side state — tokens are stateless JWTs. This endpoint exists for FCM token cleanup.',
+          responses: { 200: { description: 'OK' } },
+        },
+      },
+      '/auth/forgot-password': {
+        post: {
+          tags: ['Auth'],
+          summary: 'Request password reset email',
           security: [],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['firebase_id_token','role'], properties: { firebase_id_token: { type: 'string' }, role: { type: 'string', enum: ['owner','trainer'] } } } } } },
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { type: 'object', required: ['email'], properties: { email: { type: 'string', format: 'email' } } } } },
+          },
           responses: {
-            200: { description: 'Login successful', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/TokenPair' } } } } } },
-            404: { description: 'No account with this phone number', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
+            200: { description: 'Reset link sent (if email exists)' },
           },
         },
       },
-      '/api/auth/customer/login': {
+      '/auth/reset-password': {
         post: {
           tags: ['Auth'],
-          summary: 'Member login via phone OTP (Firebase) — issues 30-day token',
+          summary: 'Reset password using token from email',
           security: [],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['firebase_id_token'], properties: { firebase_id_token: { type: 'string' } } } } } },
-          responses: {
-            200: {
-              description: 'Single-gym: returns MemberToken. Multiple gyms: returns {multiple:true, gyms:[...], firebase_id_token} — call /auth/customer/select-gym to pick.',
-              content: { 'application/json': { schema: { $ref: '#/components/schemas/MemberToken' } } },
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object', required: ['token', 'new_password'],
+                  properties: {
+                    token: { type: 'string' },
+                    new_password: { type: 'string', minLength: 8, description: 'Min 8 chars, 1 uppercase, 1 number, 1 special char' },
+                  },
+                },
+              },
             },
-            404: { description: 'Phone not found in any gym', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
           },
-        },
-      },
-      '/api/auth/customer/select-gym': {
-        post: {
-          tags: ['Auth'],
-          summary: 'Select one gym when member belongs to multiple',
-          security: [],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['firebase_id_token','member_id'], properties: { firebase_id_token: { type: 'string' }, member_id: { type: 'string', format: 'uuid' } } } } } },
           responses: {
-            200: { description: 'Token issued for chosen gym', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/MemberToken' } } } } } },
-            403: { description: 'member_id does not match the phone in Firebase token', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
+            200: { description: 'Password reset successful' },
+            400: { description: 'Invalid or expired token' },
           },
         },
       },
-      '/api/auth/forgot-password': {
+      '/auth/verify-firebase': {
         post: {
           tags: ['Auth'],
-          summary: 'Request password reset (emails OTP; always 200)',
+          summary: 'Exchange Firebase phone ID token for app JWT (owner/trainer only)',
           security: [],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['email'], properties: { email: { type: 'string', format: 'email' } } } } } },
-          responses: { 200: { description: 'OTP sent (or silently ignored to prevent email enumeration)' } },
-        },
-      },
-      '/api/auth/verify-reset-otp': {
-        post: {
-          tags: ['Auth'],
-          summary: 'Verify password reset OTP → receive reset token',
-          security: [],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['email','otp_code'], properties: { email: { type: 'string', format: 'email' }, otp_code: { type: 'string', minLength: 6, maxLength: 6 } } } } } },
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object', required: ['firebase_id_token', 'role'],
+                  properties: {
+                    firebase_id_token: { type: 'string' },
+                    role: { type: 'string', enum: ['owner', 'trainer'] },
+                  },
+                },
+              },
+            },
+          },
           responses: {
-            200: { description: 'Reset token issued', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { reset_token: { type: 'string' } } } } } } } },
-            400: { description: 'Invalid or expired OTP', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
+            200: { description: 'JWT issued', content: { 'application/json': { schema: { $ref: '#/components/schemas/LoginResponse' } } } },
+            404: { description: 'No account found for this phone' },
           },
         },
       },
-      '/api/auth/reset-password': {
-        post: {
-          tags: ['Auth'],
-          summary: 'Set a new password using the reset token',
-          security: [],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['token','new_password'], properties: { token: { type: 'string' }, new_password: { type: 'string', minLength: 8, description: 'Uppercase + digit + special char required' } } } } } },
-          responses: {
-            200: { description: 'Password updated successfully' },
-            400: { description: 'Invalid or expired token', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
-          },
-        },
-      },
-      '/api/auth/fcm-token': {
+      '/auth/fcm-token': {
         put: {
           tags: ['Auth'],
-          summary: 'Register device FCM push token (mobile only)',
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['fcm_token'], properties: { fcm_token: { type: 'string' } } } } } },
+          summary: 'Register FCM push notification token',
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { type: 'object', required: ['fcm_token'], properties: { fcm_token: { type: 'string' } } } } },
+          },
           responses: { 200: { description: 'Token saved' } },
         },
       },
 
-      // ── Members ───────────────────────────────────────────────────────────────
-      '/api/members': {
-        get: {
-          tags: ['Members'],
-          summary: 'List members — owner sees all, trainer sees only their assigned members',
-          parameters: [
-            { in: 'query', name: 'page',       schema: { type: 'integer', default: 1 } },
-            { in: 'query', name: 'limit',      schema: { type: 'integer', default: 20, maximum: 100 } },
-            { in: 'query', name: 'status',     schema: { type: 'string', enum: ['active','at_risk','high_risk'] } },
-            { in: 'query', name: 'trainer_id', schema: { type: 'string', format: 'uuid' } },
-          ],
-          responses: {
-            200: { description: 'Paginated member list', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: {
-              members: { type: 'array', items: { $ref: '#/components/schemas/Member' } },
-              total: { type: 'integer' }, page: { type: 'integer' }, pages: { type: 'integer' },
-            } } } } } } },
-          },
-        },
+      // ── Gym Registration (public multi-step flow) ─────────────────────
+      '/gyms/register': {
         post: {
-          tags: ['Members'],
-          summary: 'Add a new member',
-          description: 'If the same phone/email was previously deleted, the slot is automatically freed and the member is re-created.',
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['name','phone','membership_expiry_date','plan_fee'], properties: {
-            name:                   { type: 'string', minLength: 2, maxLength: 100 },
-            phone:                  { type: 'string', example: '9876543210' },
-            email:                  { type: 'string', format: 'email' },
-            last_visit_date:        { type: 'string', format: 'date' },
-            membership_expiry_date: { type: 'string', format: 'date' },
-            plan_fee:               { type: 'number', minimum: 0 },
-            assigned_trainer_id:    { type: 'string', format: 'uuid' },
-          } } } } },
-          responses: {
-            201: { description: 'Member created', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/Member' } } } } } },
-            409: { description: 'Active member with this phone or email already exists', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
-          },
-        },
-      },
-      '/api/members/export': {
-        get: {
-          tags: ['Members'],
-          summary: 'Export all gym members as CSV',
-          responses: { 200: { description: 'CSV download', content: { 'text/csv': { schema: { type: 'string' } } } } },
-        },
-      },
-      '/api/members/bulk-import': {
-        post: {
-          tags: ['Members'],
-          summary: 'Bulk-import members from array (max 5 000)',
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { trainer_id: { type: 'string', format: 'uuid' }, members: { type: 'array', maxItems: 5000, items: { type: 'object', properties: { name: { type: 'string' }, phone: { type: 'string' }, email: { type: 'string' }, plan_fee: { type: 'number' }, membership_expiry_date: { type: 'string' }, last_visit_date: { type: 'string' } } } } } } } } },
-          responses: { 200: { description: 'Import summary', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { imported: { type: 'integer' }, skipped: { type: 'integer' }, errors: { type: 'array', items: { type: 'object' } } } } } } } } } },
-        },
-      },
-      '/api/members/{id}': {
-        put: {
-          tags: ['Members'],
-          summary: 'Update member details',
-          parameters: [{ in: 'path', name: 'id', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { name: { type: 'string' }, phone: { type: 'string' }, email: { type: 'string' }, membership_expiry_date: { type: 'string', format: 'date' }, plan_fee: { type: 'number' } } } } } },
-          responses: { 200: { description: 'Updated' }, 404: { description: 'Not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } } },
-        },
-        delete: {
-          tags: ['Members'],
-          summary: 'Soft-delete a member (hidden from app; data retained)',
-          parameters: [{ in: 'path', name: 'id', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          responses: { 200: { description: 'Deleted' } },
-        },
-      },
-      '/api/members/{id}/data': {
-        delete: {
-          tags: ['Members'],
-          summary: 'GDPR erase — permanently destroy member PII',
-          description: '⚠️ Irreversible. Overwrites name/phone/email with `[deleted]` and hard-deletes attendance logs. Use only on explicit data-erasure requests.',
-          parameters: [{ in: 'path', name: 'id', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          responses: { 200: { description: 'PII erased' }, 404: { description: 'Not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } } },
-        },
-      },
-
-      // ── Trainers ─────────────────────────────────────────────────────────────
-      '/api/trainers': {
-        get: {
-          tags: ['Trainers'],
-          summary: 'List all staff members (owner only)',
-          parameters: [
-            { in: 'query', name: 'page',  schema: { type: 'integer', default: 1 } },
-            { in: 'query', name: 'limit', schema: { type: 'integer', default: 20, maximum: 100 } },
-          ],
-          responses: { 200: { description: 'Trainer list', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { trainers: { type: 'array', items: { $ref: '#/components/schemas/Trainer' } }, total: { type: 'integer' }, page: { type: 'integer' }, pages: { type: 'integer' } } } } } } } } },
-        },
-        post: {
-          tags: ['Trainers'],
-          summary: 'Add a new staff member (creates login account)',
-          description: 'If the email was previously used by a deleted trainer, the slot is automatically freed.',
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['name','phone','email','password'], properties: {
-            name:     { type: 'string', minLength: 2 },
-            phone:    { type: 'string' },
-            email:    { type: 'string', format: 'email' },
-            password: { type: 'string', minLength: 8, description: 'Uppercase + digit + special char required' },
-          } } } } },
-          responses: {
-            201: { description: 'Trainer created', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/Trainer' } } } } } },
-            409: { description: 'Email already in use', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
-          },
-        },
-      },
-      '/api/trainers/me': {
-        get: {
-          tags: ['Trainers'],
-          summary: "Logged-in trainer's profile (trainer role only)",
-          responses: { 200: { description: 'Trainer profile' } },
-        },
-      },
-      '/api/trainers/bulk-import': {
-        post: {
-          tags: ['Trainers'],
-          summary: 'Bulk-import staff members (max 200)',
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { trainers: { type: 'array', maxItems: 200, items: { type: 'object', properties: { name: { type: 'string' }, phone: { type: 'string' }, email: { type: 'string' } } } } } } } } },
-          responses: { 200: { description: 'Import summary' } },
-        },
-      },
-      '/api/trainers/{id}': {
-        patch: {
-          tags: ['Trainers'],
-          summary: 'Update trainer name, phone, or email',
-          parameters: [{ in: 'path', name: 'id', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { name: { type: 'string' }, phone: { type: 'string' }, email: { type: 'string', format: 'email' } } } } } },
-          responses: { 200: { description: 'Updated', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/Trainer' } } } } } } },
-        },
-        delete: {
-          tags: ['Trainers'],
-          summary: 'Soft-delete trainer; email slot freed immediately for re-use',
-          parameters: [{ in: 'path', name: 'id', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          responses: { 200: { description: 'Trainer deleted' } },
-        },
-      },
-      '/api/trainers/{id}/assign-members': {
-        post: {
-          tags: ['Trainers'],
-          summary: 'Assign members to a trainer',
-          parameters: [{ in: 'path', name: 'id', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['member_ids'], properties: { member_ids: { type: 'array', items: { type: 'string', format: 'uuid' } } } } } } },
-          responses: { 200: { description: 'Members assigned' } },
-        },
-      },
-
-      // ── Tasks ─────────────────────────────────────────────────────────────────
-      '/api/tasks': {
-        get: {
-          tags: ['Tasks'],
-          summary: 'List tasks — owner sees all; trainer sees only theirs',
-          parameters: [
-            { in: 'query', name: 'status',     schema: { type: 'string', enum: ['pending','completed'] } },
-            { in: 'query', name: 'trainer_id', schema: { type: 'string', format: 'uuid' } },
-            { in: 'query', name: 'member_id',  schema: { type: 'string', format: 'uuid' } },
-            { in: 'query', name: 'page',       schema: { type: 'integer', default: 1 } },
-            { in: 'query', name: 'limit',      schema: { type: 'integer', default: 20, maximum: 100 } },
-          ],
-          responses: { 200: { description: 'Paginated task list', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { tasks: { type: 'array', items: { $ref: '#/components/schemas/Task' } }, total: { type: 'integer' }, page: { type: 'integer' }, pages: { type: 'integer' } } } } } } } } },
-        },
-        post: {
-          tags: ['Tasks'],
-          summary: 'Create a follow-up task (auto-assigns to member\'s trainer)',
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['member_id','task_type'], properties: {
-            member_id:           { type: 'string', format: 'uuid' },
-            task_type:           { type: 'string', enum: ['call','renewal','check_in'] },
-            assigned_trainer_id: { type: 'string', format: 'uuid', description: 'Defaults to member\'s assigned trainer' },
-            notes:               { type: 'string', maxLength: 500 },
-          } } } } },
-          responses: { 201: { description: 'Task created', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/Task' } } } } } } },
-        },
-      },
-      '/api/tasks/{id}': {
-        patch: {
-          tags: ['Tasks'],
-          summary: 'Complete a task (trainer only)',
-          parameters: [{ in: 'path', name: 'id', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['outcome'], properties: {
-            outcome: { type: 'string', enum: ['called','not_reachable','coming_tomorrow','renewed','no_action'] },
-            notes:   { type: 'string' },
-          } } } } },
-          responses: { 200: { description: 'Task completed' } },
-        },
-      },
-
-      // ── Attendance ────────────────────────────────────────────────────────────
-      '/api/attendance': {
-        post: {
-          tags: ['Attendance'],
-          summary: 'Mark a member visit (owner or trainer)',
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['member_id','visit_date'], properties: { member_id: { type: 'string', format: 'uuid' }, visit_date: { type: 'string', format: 'date' }, check_in_time: { type: 'string', example: '09:30:00' } } } } } },
-          responses: { 200: { description: 'Attendance marked' } },
-        },
-        get: {
-          tags: ['Attendance'],
-          summary: 'List attendance records for a date',
-          parameters: [{ in: 'query', name: 'date', schema: { type: 'string', format: 'date', description: 'Defaults to today' } }],
-          responses: { 200: { description: 'Attendance list' } },
-        },
-      },
-      '/api/members/{memberId}/attendance': {
-        get: {
-          tags: ['Attendance'],
-          summary: "Member's monthly calendar — present/absent dates (owner/staff view)",
-          parameters: [
-            { in: 'path',  name: 'memberId', required: true, schema: { $ref: '#/components/schemas/Uuid' } },
-            { in: 'query', name: 'month',    schema: { type: 'string', example: '2026-05', description: 'YYYY-MM; defaults to current month' } },
-          ],
-          responses: { 200: { description: 'Calendar data', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { member: { $ref: '#/components/schemas/Member' }, present_dates: { type: 'array', items: { type: 'string', format: 'date' } }, month: { type: 'string' } } } } } } } } },
-        },
-      },
-
-      // ── Profile ───────────────────────────────────────────────────────────────
-      '/api/profile': {
-        get: {
-          tags: ['Profile'],
-          summary: "Current user's profile (owner or trainer)",
-          responses: { 200: { description: 'Profile data including gym details for owners' } },
-        },
-        put: {
-          tags: ['Profile'],
-          summary: 'Update name, phone, email; optionally change password',
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['name'], properties: {
-            name:            { type: 'string', minLength: 2, maxLength: 100 },
-            phone:           { type: 'string' },
-            email:           { type: 'string', format: 'email' },
-            currentPassword: { type: 'string', description: 'Required if setting newPassword' },
-            newPassword:     { type: 'string', minLength: 6 },
-          } } } } },
-          responses: { 200: { description: 'Updated' }, 400: { description: 'Incorrect current password', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } } },
-        },
-      },
-      '/api/profile/verify-phone': {
-        post: {
-          tags: ['Profile'],
-          summary: 'Verify owner/trainer phone via Firebase OTP',
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['firebase_id_token'], properties: { firebase_id_token: { type: 'string' } } } } } },
-          responses: { 200: { description: 'Phone verified', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { message: { type: 'string' }, phone: { type: 'string' } } } } } } } } },
-        },
-      },
-      '/api/gyms/me': {
-        put: {
-          tags: ['Profile'],
-          summary: 'Update gym name, address, phone, and Razorpay payment keys',
-          description: 'Razorpay key_secret is write-only and never returned in any response.',
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['gymName'], properties: {
-            gymName:             { type: 'string', minLength: 2, maxLength: 100 },
-            address:             { type: 'string' },
-            phone:               { type: 'string' },
-            razorpay_key_id:     { type: 'string', example: 'rzp_live_xxxxxxxx', description: 'Publishable key from Razorpay dashboard' },
-            razorpay_key_secret: { type: 'string', description: 'Secret key — stored server-side only' },
-          } } } } },
-          responses: { 200: { description: 'Gym settings updated' } },
-        },
-      },
-
-      // ── Customer Portal ───────────────────────────────────────────────────────
-      '/api/customer/profile': {
-        get: {
-          tags: ['Customer Portal'],
-          summary: "Member's own profile + gym info",
-          responses: { 200: { description: 'Profile', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/CustomerProfile' } } } } } } },
-        },
-        put: {
-          tags: ['Customer Portal'],
-          summary: 'Update name and/or email (phone cannot be changed — it is the login credential)',
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['name'], properties: { name: { type: 'string', minLength: 2 }, email: { type: 'string', format: 'email' } } } } } },
-          responses: { 200: { description: 'Profile updated' } },
-        },
-      },
-      '/api/customer/attendance': {
-        get: {
-          tags: ['Customer Portal'],
-          summary: "Member's own monthly attendance",
-          parameters: [
-            { in: 'query', name: 'year',  schema: { type: 'integer', example: 2026 } },
-            { in: 'query', name: 'month', schema: { type: 'integer', minimum: 1, maximum: 12, example: 5 } },
-          ],
-          responses: { 200: { description: 'Attendance records', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'array', items: { type: 'object', properties: { date: { type: 'string', format: 'date' }, status: { type: 'string', enum: ['present','absent'] } } } } } } } } } },
-        },
-      },
-      '/api/customer/payments': {
-        get: {
-          tags: ['Customer Portal'],
-          summary: "Member's own payment history",
-          parameters: [
-            { in: 'query', name: 'page',  schema: { type: 'integer', default: 1 } },
-            { in: 'query', name: 'limit', schema: { type: 'integer', default: 20, maximum: 50 } },
-          ],
-          responses: { 200: { description: 'Payment history', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { payments: { type: 'array', items: { $ref: '#/components/schemas/Payment' } }, total: { type: 'integer' } } } } } } } } },
-        },
-      },
-
-      // ── Payments ─────────────────────────────────────────────────────────────
-      '/api/payments/create-order': {
-        post: {
-          tags: ['Payments'],
-          summary: 'Create Razorpay order for gym membership renewal (member)',
-          description: 'Returns `order_id` and `key_id` to pass to the Razorpay Flutter SDK.',
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['amount'], properties: {
-            amount:      { type: 'number', minimum: 1, example: 7462, description: 'Amount in rupees (not paise)' },
-            description: { type: 'string', example: 'Monthly gym subscription' },
-          } } } } },
-          responses: {
-            200: { description: 'Razorpay order ready', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: {
-              order_id: { type: 'string', example: 'order_ABC123' },
-              amount:   { type: 'integer', example: 746200, description: 'Amount in paise' },
-              currency: { type: 'string', example: 'INR' },
-              key_id:   { type: 'string', example: 'rzp_live_xxxxx', description: 'Pass as `key` to Razorpay SDK' },
-            } } } } } } },
-            400: { description: 'Razorpay not configured for this gym — owner must set keys in gym settings', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
-          },
-        },
-      },
-      '/api/payments/verify': {
-        post: {
-          tags: ['Payments'],
-          summary: 'Verify Razorpay signature + record successful payment (member)',
-          description: 'Call this immediately in the Razorpay `onSuccess` callback. Verifies HMAC-SHA256 and marks payment `completed`.',
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['razorpay_order_id','razorpay_payment_id','razorpay_signature'], properties: {
-            razorpay_order_id:   { type: 'string' },
-            razorpay_payment_id: { type: 'string' },
-            razorpay_signature:  { type: 'string', description: 'HMAC-SHA256 from Razorpay success callback' },
-          } } } } },
-          responses: {
-            200: { description: 'Payment verified', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { message: { type: 'string' }, payment_id: { type: 'string', format: 'uuid' } } } } } } } },
-            400: { description: 'Signature mismatch — payment rejected', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
-          },
-        },
-      },
-      '/api/payments': {
-        get: {
-          tags: ['Payments'],
-          summary: "All gym's completed payments (owner)",
-          parameters: [
-            { in: 'query', name: 'month',     schema: { type: 'string', example: '2026-05', description: 'YYYY-MM filter' } },
-            { in: 'query', name: 'member_id', schema: { type: 'string', format: 'uuid' } },
-            { in: 'query', name: 'page',      schema: { type: 'integer', default: 1 } },
-            { in: 'query', name: 'limit',     schema: { type: 'integer', default: 50, maximum: 100 } },
-          ],
-          responses: { 200: { description: 'Payment list with aggregate total', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: {
-            payments:     { type: 'array', items: { $ref: '#/components/schemas/Payment' } },
-            total:        { type: 'integer' },
-            total_amount: { type: 'integer', description: 'Sum of amounts in paise' },
-          } } } } } } } },
-        },
-      },
-      '/api/payments/report': {
-        get: {
-          tags: ['Payments'],
-          summary: 'Download monthly payment report as CSV (owner)',
-          parameters: [{ in: 'query', name: 'month', schema: { type: 'string', example: '2026-05', description: 'YYYY-MM; defaults to current month' } }],
-          responses: {
-            200: {
-              description: 'CSV file',
-              content: { 'text/csv': { schema: { type: 'string', example: 'Member Name,Phone,Amount (Rs),Method,Description,Date\n"Kishore R",8783463233,7462.00,upi,,01-05-2026\n\nTOTAL,, 7462.00,,, 1 payments' } } },
-            },
-          },
-        },
-      },
-
-      // ── Dashboard ─────────────────────────────────────────────────────────────
-      '/api/dashboard/kpis': {
-        get: {
-          tags: ['Dashboard'],
-          summary: 'Owner KPI summary — member counts by status and revenue',
-          responses: { 200: { description: 'KPI data', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: {
-            totalMembers:    { type: 'integer' },
-            activeMembers:   { type: 'integer' },
-            atRiskMembers:   { type: 'integer' },
-            highRiskMembers: { type: 'integer' },
-            revenueRecovered: { type: 'number' },
-          } } } } } } } },
-        },
-      },
-      '/api/revenue': {
-        get: {
-          tags: ['Dashboard'],
-          summary: 'Revenue tracking — monthly breakdown and metrics',
-          responses: { 200: { description: 'Revenue data' } },
-        },
-      },
-
-      // ── Subscription ──────────────────────────────────────────────────────────
-      '/api/gyms/{gymId}/subscription': {
-        get: {
-          tags: ['Subscription'],
-          summary: "Recurva subscription status and available upgrade plans",
-          parameters: [{ in: 'path', name: 'gymId', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          responses: { 200: { description: 'Subscription info', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: {
-            status:             { type: 'string', enum: ['trial','active','expired'] },
-            daysRemaining:      { type: 'integer' },
-            trialEndsAt:        { type: 'string', format: 'date-time', nullable: true },
-            subscriptionEndsAt: { type: 'string', format: 'date-time', nullable: true },
-            plans:              { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, label: { type: 'string' }, amountInPaise: { type: 'integer' }, months: { type: 'integer' } } } },
-          } } } } } } } },
-        },
-      },
-      '/api/gyms/{gymId}/billing/create-order': {
-        post: {
-          tags: ['Subscription'],
-          summary: 'Create Razorpay order for Recurva subscription',
-          parameters: [{ in: 'path', name: 'gymId', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['plan'], properties: { plan: { type: 'string', enum: ['monthly','quarterly','annual'] } } } } } },
-          responses: { 200: { description: 'Razorpay order created' } },
-        },
-      },
-      '/api/gyms/{gymId}/billing/verify-payment': {
-        post: {
-          tags: ['Subscription'],
-          summary: 'Verify Recurva subscription payment and activate plan',
-          parameters: [{ in: 'path', name: 'gymId', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['razorpay_order_id','razorpay_payment_id','razorpay_signature','plan'], properties: {
-            razorpay_order_id:   { type: 'string' },
-            razorpay_payment_id: { type: 'string' },
-            razorpay_signature:  { type: 'string' },
-            plan:                { type: 'string', enum: ['monthly','quarterly','annual'] },
-          } } } } },
-          responses: { 200: { description: 'Subscription activated' }, 400: { description: 'Invalid signature', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } } },
-        },
-      },
-
-      // ── Admin ─────────────────────────────────────────────────────────────────
-      '/api/admin/gyms': {
-        get: {
-          tags: ['Admin'],
-          summary: 'List all gyms with metrics (admin only)',
-          security: [{ AdminSecret: [] }],
-          responses: { 200: { description: 'All gyms' }, 401: { description: 'Invalid admin secret', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } } },
-        },
-      },
-      '/api/admin/gyms/{id}/block': {
-        post: {
-          tags: ['Admin'],
-          summary: 'Block a gym — all logins immediately rejected (even with valid JWT)',
-          security: [{ AdminSecret: [] }],
-          parameters: [{ in: 'path', name: 'id', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { reason: { type: 'string' } } } } } },
-          responses: { 200: { description: 'Gym blocked' } },
-        },
-      },
-      '/api/admin/gyms/{id}/unblock': {
-        post: {
-          tags: ['Admin'],
-          summary: 'Unblock a gym',
-          security: [{ AdminSecret: [] }],
-          parameters: [{ in: 'path', name: 'id', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          responses: { 200: { description: 'Gym unblocked' } },
-        },
-      },
-      '/api/admin/gyms/{id}/suspend': {
-        post: {
-          tags: ['Admin'],
-          summary: 'Suspend a gym (subscription expired)',
-          security: [{ AdminSecret: [] }],
-          parameters: [{ in: 'path', name: 'id', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          responses: { 200: { description: 'Gym suspended' } },
-        },
-      },
-      '/api/admin/gyms/{id}/reactivate': {
-        post: {
-          tags: ['Admin'],
-          summary: 'Reactivate a suspended gym',
-          security: [{ AdminSecret: [] }],
-          parameters: [{ in: 'path', name: 'id', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          responses: { 200: { description: 'Reactivated' } },
-        },
-      },
-      '/api/admin/gyms/{id}/convert': {
-        post: {
-          tags: ['Admin'],
-          summary: 'Manually activate subscription (admin override)',
-          security: [{ AdminSecret: [] }],
-          parameters: [{ in: 'path', name: 'id', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['months'], properties: { months: { type: 'integer', minimum: 1, maximum: 12 } } } } } },
-          responses: { 200: { description: 'Subscription activated' } },
-        },
-      },
-      '/api/admin/gyms/{id}': {
-        delete: {
-          tags: ['Admin'],
-          summary: '⚠️ PERMANENTLY delete a gym and all its data',
-          description: 'Irreversible. Removes all members, trainers, tasks, attendance, revenue, billing and user accounts for the gym.',
-          security: [{ AdminSecret: [] }],
-          parameters: [{ in: 'path', name: 'id', required: true, schema: { $ref: '#/components/schemas/Uuid' } }],
-          responses: { 200: { description: 'Gym and all data permanently deleted' } },
-        },
-      },
-
-      // ── Invite Codes ──────────────────────────────────────────────────────
-      '/api/invites': {
-        post: {
-          tags: ['Invites'],
-          summary: 'Generate an invite code for a new staff member or customer',
-          description: 'Owner or admin generates a one-time 8-character invite code. Staff invites create a pending trainer slot. Member invites reserve a display ID. Codes expire after 7 days and are single-use.',
-          security: [{ BearerAuth: [] }],
+          tags: ['Gym Registration'],
+          summary: 'Step 1 — Submit business registration + send email OTP',
+          security: [],
           requestBody: {
             required: true,
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
-                  required: ['type'],
+                  required: ['ownerName', 'ownerEmail', 'ownerPhone', 'gymName', 'password'],
                   properties: {
-                    type:         { type: 'string', enum: ['staff', 'member'], description: 'Who this invite is for' },
-                    name:         { type: 'string', description: 'Optional label (required for member invites)' },
-                    phone:        { type: 'string', description: 'Optional phone hint (member invites)' },
-                    trainer_role: { type: 'string', enum: ['staff', 'admin'], default: 'staff', description: 'Role for staff invites' },
+                    ownerName: { type: 'string' },
+                    ownerEmail: { type: 'string', format: 'email' },
+                    ownerPhone: { type: 'string' },
+                    gymName: { type: 'string' },
+                    gymAddress: { type: 'string' },
+                    password: { type: 'string', minLength: 8 },
                   },
-                },
-                examples: {
-                  staffInvite:  { summary: 'Staff invite',  value: { type: 'staff',  name: 'John Trainer', trainer_role: 'staff'  } },
-                  adminInvite:  { summary: 'Admin invite',  value: { type: 'staff',  name: 'Jane Manager', trainer_role: 'admin'  } },
-                  memberInvite: { summary: 'Member invite', value: { type: 'member', name: 'Alice Member',  phone: '9876543210'    } },
                 },
               },
             },
           },
           responses: {
-            201: { description: 'Invite code generated', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/InviteCode' } } } } } },
-            400: { description: 'Missing required fields' },
-            401: { description: 'Unauthorized' },
-          },
-        },
-        get: {
-          tags: ['Invites'],
-          summary: 'List all active (unused, non-expired) invite codes for this gym',
-          security: [{ BearerAuth: [] }],
-          responses: {
-            200: { description: 'Array of active invite codes', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'array', items: { $ref: '#/components/schemas/InviteCode' } } } } } } },
-            401: { description: 'Unauthorized' },
+            200: { description: 'Pending registration created, OTP sent', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { pendingId: { type: 'string' }, ownerEmail: { type: 'string' } } } } } } } },
+            409: { description: 'Email already registered' },
           },
         },
       },
-      '/api/invites/{code}': {
-        get: {
-          tags: ['Invites'],
-          summary: 'Validate an invite code — public, no auth required',
-          description: 'Returns invite details if the code is valid, unused and not expired. Used by the staff registration screen to show gym name and role before the person enters their details.',
-          parameters: [{ in: 'path', name: 'code', required: true, schema: { type: 'string', example: 'A7K3MP2Q' }, description: '8-char invite code (case-insensitive)' }],
+      '/gyms/verify-email': {
+        post: {
+          tags: ['Gym Registration'],
+          summary: 'Step 2 — Verify email OTP',
+          security: [],
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { type: 'object', required: ['pendingId', 'otpCode'], properties: { pendingId: { type: 'string' }, otpCode: { type: 'string', minLength: 6, maxLength: 6 } } } } },
+          },
           responses: {
-            200: { description: 'Code is valid', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/InviteCodeInfo' } } } } } },
-            404: { description: 'Invalid, used or expired code' },
+            200: { description: 'Email verified, proceed to phone verification' },
+            400: { description: 'Invalid OTP' },
+          },
+        },
+      },
+      '/gyms/complete-registration': {
+        post: {
+          tags: ['Gym Registration'],
+          summary: 'Step 3 — Verify phone via Firebase, create gym + owner account',
+          security: [],
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { type: 'object', required: ['pendingId', 'firebase_id_token'], properties: { pendingId: { type: 'string' }, firebase_id_token: { type: 'string' } } } } },
+          },
+          responses: {
+            201: { description: 'Gym created, owner logged in', content: { 'application/json': { schema: { $ref: '#/components/schemas/LoginResponse' } } } },
           },
         },
       },
 
-      // ── Staff Self-Registration ───────────────────────────────────────────
-      '/api/auth/staff/register': {
+      // ── Staff Self-Registration ───────────────────────────────────────
+      '/auth/staff/register': {
         post: {
           tags: ['Auth'],
-          summary: 'Staff self-registration using invite code — public',
-          description: 'Staff member enters an owner-generated invite code and sets their own name, email, phone and password. On success, returns a JWT pair and the person is immediately logged in. The invite code is consumed and cannot be reused.',
+          summary: 'Staff self-registration using invite code',
+          security: [],
           requestBody: {
             required: true,
             content: {
@@ -956,89 +455,734 @@ Use \`Authorization: Bearer <ADMIN_SECRET>\` (value from server \`.env\`).
                   type: 'object',
                   required: ['code', 'name', 'email', 'phone', 'password'],
                   properties: {
-                    code:     { type: 'string', example: 'A7K3MP2Q' },
-                    name:     { type: 'string', example: 'John Trainer' },
-                    email:    { type: 'string', format: 'email', example: 'john@example.com', description: 'Used as login identifier' },
-                    phone:    { type: 'string', example: '9876543210' },
-                    password: { type: 'string', format: 'password', example: 'Trainer@123', description: 'Min 8 chars, 1 uppercase, 1 number, 1 special char' },
+                    code: { type: 'string', minLength: 8, maxLength: 8, example: 'ABCD1234' },
+                    name: { type: 'string' },
+                    email: { type: 'string', format: 'email' },
+                    phone: { type: 'string' },
+                    password: { type: 'string', minLength: 8 },
                   },
                 },
               },
             },
           },
           responses: {
-            201: {
-              description: 'Registration successful — JWT pair returned',
-              content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/TokenPair' } } } } },
-            },
-            400: { description: 'Invalid/expired invite code or missing fields' },
-            409: { description: 'Email already registered in this gym' },
+            201: { description: 'Account created, logged in', content: { 'application/json': { schema: { $ref: '#/components/schemas/LoginResponse' } } } },
+            400: { description: 'Invalid or expired invite code' },
+            409: { description: 'Email already registered' },
           },
         },
       },
 
-      // ── Member Invite Linking ─────────────────────────────────────────────
-      '/api/auth/customer/link-invite': {
+      // ── Member Self-Registration ──────────────────────────────────────
+      '/auth/member/send-email-otp': {
         post: {
-          tags: ['Customer Portal'],
-          summary: 'Link a member account via invite code — public',
-          description: 'Called when a member completes phone OTP but their number is not found in any gym. They enter the invite code provided by the gym owner to link their Firebase phone identity to the pre-created member record.',
+          tags: ['Auth'],
+          summary: 'Send email OTP for member registration verification',
+          description: 'Step 1 of member registration. Validates invite code and sends a 6-digit OTP to the provided email. Returns a tempKey to be used in /auth/member/register.',
+          security: [],
           requestBody: {
             required: true,
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
-                  required: ['firebase_id_token', 'code'],
+                  required: ['code', 'email'],
                   properties: {
-                    firebase_id_token: { type: 'string', description: 'Firebase ID token from phone OTP verification' },
-                    code:              { type: 'string', example: 'B9MNQRST', description: '8-char member invite code' },
+                    code: { type: 'string', minLength: 8, maxLength: 8 },
+                    email: { type: 'string', format: 'email' },
                   },
                 },
               },
             },
           },
           responses: {
-            200: { description: 'Account linked — member JWT returned', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/MemberToken' } } } } } },
-            400: { description: 'Invalid/expired invite code' },
-            401: { description: 'Invalid Firebase token' },
-            404: { description: 'No matching member record found' },
+            200: { description: 'OTP sent', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { tempKey: { type: 'string', description: 'Pass this to /auth/member/register as emailOtpKey' } } } } } } } },
+            400: { description: 'Invalid invite code' },
+          },
+        },
+      },
+      '/auth/member/register': {
+        post: {
+          tags: ['Auth'],
+          summary: 'Member self-registration using invite code',
+          description: 'Creates member user account. Pass emailOtpKey + emailOtp (from send-email-otp) and firebaseIdToken (from Firebase phone OTP) to verify contacts and set verified flags on the member record.',
+          security: [],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['code', 'name', 'email', 'phone', 'password'],
+                  properties: {
+                    code: { type: 'string', minLength: 8, maxLength: 8 },
+                    name: { type: 'string' },
+                    email: { type: 'string', format: 'email' },
+                    phone: { type: 'string' },
+                    password: { type: 'string', minLength: 8 },
+                    emailOtpKey: { type: 'string', description: 'From /auth/member/send-email-otp' },
+                    emailOtp: { type: 'string', minLength: 6, maxLength: 6 },
+                    firebaseIdToken: { type: 'string', description: 'Firebase ID token after phone OTP verification' },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            201: { description: 'Member account created, logged in', content: { 'application/json': { schema: { $ref: '#/components/schemas/LoginResponse' } } } },
+            400: { description: 'Invalid invite code or OTP' },
+            409: { description: 'Email already registered' },
+          },
+        },
+      },
+      '/auth/invite-code/validate': {
+        post: {
+          tags: ['Invite Codes'],
+          summary: 'Validate an invite code (public)',
+          security: [],
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { type: 'object', required: ['code'], properties: { code: { type: 'string', example: 'ABCD1234' } } } } },
+          },
+          responses: {
+            200: { description: 'Valid code info returned', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { type: { type: 'string', enum: ['staff', 'member'] }, gym_name: { type: 'string' }, display_id: { type: 'string' }, trainer_role: { type: 'string', nullable: true }, placeholder_name: { type: 'string', nullable: true } } } } } } } },
+            400: { description: 'Invalid or expired code' },
           },
         },
       },
 
-      // ── Trainer Role Management ───────────────────────────────────────────
-      '/api/trainers/{id}/role': {
+      // ════════════════════════════════════════════════════════════════════
+      // GYMS
+      // ════════════════════════════════════════════════════════════════════
+      '/gyms/me': {
+        get: {
+          tags: ['Gyms'],
+          summary: 'Get own gym profile',
+          responses: { 200: { description: 'Gym profile', content: { 'application/json': { schema: { $ref: '#/components/schemas/Gym' } } } } },
+        },
+        put: {
+          tags: ['Gyms'],
+          summary: 'Update gym profile (name, address, Razorpay keys)',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    gymName: { type: 'string' },
+                    address: { type: 'string' },
+                    razorpay_key_id: { type: 'string' },
+                    razorpay_key_secret: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: 'Updated' } },
+        },
+      },
+      '/gyms/{gymId}/subscription': {
+        get: {
+          tags: ['Gyms'],
+          summary: 'Get subscription status',
+          parameters: [{ in: 'path', name: 'gymId', required: true, schema: { type: 'string', format: 'uuid' } }],
+          responses: { 200: { description: 'Subscription details' } },
+        },
+      },
+      '/gyms/{gymId}/billing/create-order': {
+        post: {
+          tags: ['Gyms'],
+          summary: 'Create Razorpay order for gym subscription',
+          parameters: [{ in: 'path', name: 'gymId', required: true, schema: { type: 'string', format: 'uuid' } }],
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { type: 'object', required: ['plan'], properties: { plan: { type: 'string', enum: ['monthly', 'quarterly', 'annual'] } } } } },
+          },
+          responses: { 200: { description: 'Order created' } },
+        },
+      },
+      '/gyms/{gymId}/billing/verify-payment': {
+        post: {
+          tags: ['Gyms'],
+          summary: 'Verify Razorpay payment for gym subscription',
+          parameters: [{ in: 'path', name: 'gymId', required: true, schema: { type: 'string', format: 'uuid' } }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['razorpay_order_id', 'razorpay_payment_id', 'razorpay_signature', 'plan'],
+                  properties: {
+                    razorpay_order_id: { type: 'string' },
+                    razorpay_payment_id: { type: 'string' },
+                    razorpay_signature: { type: 'string' },
+                    plan: { type: 'string', enum: ['monthly', 'quarterly', 'annual'] },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: 'Payment verified, subscription activated' } },
+        },
+      },
+
+      // ════════════════════════════════════════════════════════════════════
+      // MEMBERS
+      // ════════════════════════════════════════════════════════════════════
+      '/members': {
+        get: {
+          tags: ['Members'],
+          summary: 'List all members',
+          parameters: [
+            { in: 'query', name: 'status', schema: { type: 'string', enum: ['active', 'at_risk', 'high_risk'] } },
+            { in: 'query', name: 'search', schema: { type: 'string' }, description: 'Search by name/phone/email' },
+            { in: 'query', name: 'trainer_id', schema: { type: 'string', format: 'uuid' } },
+            { in: 'query', name: 'page', schema: { type: 'integer', default: 1 } },
+            { in: 'query', name: 'limit', schema: { type: 'integer', default: 50, maximum: 200 } },
+          ],
+          responses: {
+            200: { description: 'Member list', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'array', items: { $ref: '#/components/schemas/Member' } }, total: { type: 'integer' } } } } } },
+          },
+        },
+        post: {
+          tags: ['Members'],
+          summary: 'Add a single member',
+          requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/MemberInput' } } } },
+          responses: {
+            201: { description: 'Member created', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/Member' } } } } } },
+          },
+        },
+      },
+      '/members/{id}': {
+        put: {
+          tags: ['Members'],
+          summary: 'Update member details',
+          parameters: [{ in: 'path', name: 'id', required: true, schema: { type: 'string', format: 'uuid' } }],
+          requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/MemberInput' } } } },
+          responses: { 200: { description: 'Updated' } },
+        },
+        delete: {
+          tags: ['Members'],
+          summary: 'Soft-delete member (GDPR erase)',
+          description: 'Anonymises name, phone, email with unique placeholders. Sets is_deleted=true.',
+          parameters: [{ in: 'path', name: 'id', required: true, schema: { type: 'string', format: 'uuid' } }],
+          responses: { 200: { description: 'Member erased' } },
+        },
+      },
+      '/members/bulk-import': {
+        post: {
+          tags: ['Members'],
+          summary: 'Bulk import members from CSV/Excel data',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['members'],
+                  properties: {
+                    trainer_id: { type: 'string', format: 'uuid', nullable: true },
+                    members: {
+                      type: 'array',
+                      items: { $ref: '#/components/schemas/MemberInput' },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: 'Import summary with created/skipped counts' } },
+        },
+      },
+
+      // ════════════════════════════════════════════════════════════════════
+      // TRAINERS
+      // ════════════════════════════════════════════════════════════════════
+      '/trainers': {
+        get: {
+          tags: ['Trainers'],
+          summary: 'List all trainers/staff',
+          responses: { 200: { description: 'Trainer list', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'array', items: { $ref: '#/components/schemas/Trainer' } } } } } } } },
+        },
+        post: {
+          tags: ['Trainers'],
+          summary: 'Add a trainer (creates pending slot + invite code)',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['name', 'phone'],
+                  properties: {
+                    name: { type: 'string' },
+                    phone: { type: 'string' },
+                    email: { type: 'string', format: 'email' },
+                    trainer_role: { type: 'string', enum: ['staff', 'admin'], default: 'staff' },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 201: { description: 'Trainer slot created' } },
+        },
+      },
+      '/trainers/me': {
+        get: {
+          tags: ['Trainers'],
+          summary: 'Get own trainer profile (trainer role only)',
+          responses: { 200: { description: 'Trainer profile' } },
+        },
+      },
+      '/trainers/{id}': {
+        patch: {
+          tags: ['Trainers'],
+          summary: 'Update trainer details',
+          parameters: [{ in: 'path', name: 'id', required: true, schema: { type: 'string', format: 'uuid' } }],
+          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { name: { type: 'string' }, phone: { type: 'string' }, email: { type: 'string' } } } } } },
+          responses: { 200: { description: 'Updated' } },
+        },
+        delete: {
+          tags: ['Trainers'],
+          summary: 'Remove trainer',
+          parameters: [{ in: 'path', name: 'id', required: true, schema: { type: 'string', format: 'uuid' } }],
+          responses: { 200: { description: 'Deleted' } },
+        },
+      },
+      '/trainers/{id}/role': {
         put: {
           tags: ['Trainers'],
-          summary: 'Promote or demote a trainer (owner only)',
-          description: 'Changes a trainer\'s role between `staff` and `admin`. Admin trainers get the same access as the owner for all management operations except subscription/billing/role changes. **Owner-only** — admin trainers cannot call this endpoint.',
-          security: [{ BearerAuth: [] }],
-          parameters: [{ in: 'path', name: 'id', required: true, schema: { $ref: '#/components/schemas/Uuid' }, description: 'Trainer ID' }],
+          summary: 'Promote or demote trainer role (owner only)',
+          parameters: [{ in: 'path', name: 'id', required: true, schema: { type: 'string', format: 'uuid' } }],
+          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['trainer_role'], properties: { trainer_role: { type: 'string', enum: ['staff', 'admin'] } } } } } },
+          responses: { 200: { description: 'Role updated' } },
+        },
+      },
+      '/trainers/{id}/members': {
+        put: {
+          tags: ['Trainers'],
+          summary: 'Assign/unassign members to a trainer',
+          parameters: [{ in: 'path', name: 'id', required: true, schema: { type: 'string', format: 'uuid' } }],
+          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['member_ids', 'action'], properties: { member_ids: { type: 'array', items: { type: 'string', format: 'uuid' } }, action: { type: 'string', enum: ['add', 'remove'] } } } } } },
+          responses: { 200: { description: 'Assignment updated' } },
+        },
+      },
+
+      // ════════════════════════════════════════════════════════════════════
+      // INVITE CODES
+      // ════════════════════════════════════════════════════════════════════
+      '/invite-codes': {
+        post: {
+          tags: ['Invite Codes'],
+          summary: 'Generate invite code for a member or trainer slot',
           requestBody: {
             required: true,
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
-                  required: ['trainer_role'],
+                  required: ['type'],
                   properties: {
-                    trainer_role: { type: 'string', enum: ['staff', 'admin'] },
+                    type: { type: 'string', enum: ['staff', 'member'] },
+                    member_id: { type: 'string', format: 'uuid', description: 'Required for member type' },
+                    trainer_id: { type: 'string', format: 'uuid', description: 'Required for staff type' },
                   },
-                },
-                examples: {
-                  promote: { summary: 'Promote to admin', value: { trainer_role: 'admin' } },
-                  demote:  { summary: 'Demote to staff',  value: { trainer_role: 'staff' } },
                 },
               },
             },
           },
           responses: {
-            200: { description: 'Role updated', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { id: { $ref: '#/components/schemas/Uuid' }, trainer_role: { type: 'string' } } } } } } } },
-            400: { description: 'Invalid trainer_role value' },
-            403: { description: 'Owner-only operation' },
-            404: { description: 'Trainer not found' },
+            201: { description: 'Invite code created', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/InviteCode' } } } } } },
           },
+        },
+      },
+
+      // ════════════════════════════════════════════════════════════════════
+      // ATTENDANCE (Owner/Trainer)
+      // ════════════════════════════════════════════════════════════════════
+      '/attendance': {
+        post: {
+          tags: ['Attendance'],
+          summary: 'Mark attendance for a member (staff/owner)',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['member_id', 'visit_date'],
+                  properties: {
+                    member_id: { type: 'string', format: 'uuid' },
+                    visit_date: { type: 'string', format: 'date', example: '2026-05-09' },
+                    check_in_time: { type: 'string', format: 'time', example: '09:30:00' },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            201: { description: 'Attendance marked' },
+            409: { description: 'Already marked for today' },
+          },
+        },
+        get: {
+          tags: ['Attendance'],
+          summary: 'List attendance records',
+          parameters: [
+            { in: 'query', name: 'date', schema: { type: 'string', format: 'date' }, description: 'Filter by specific date' },
+          ],
+          responses: { 200: { description: 'Attendance records', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'array', items: { $ref: '#/components/schemas/AttendanceRecord' } } } } } } } },
+        },
+      },
+      '/attendance/{memberId}': {
+        get: {
+          tags: ['Attendance'],
+          summary: 'Get attendance for a specific member by month',
+          parameters: [
+            { in: 'path', name: 'memberId', required: true, schema: { type: 'string', format: 'uuid' } },
+            { in: 'query', name: 'month', required: true, schema: { type: 'string', pattern: '^\\d{4}-\\d{2}$', example: '2026-05' } },
+          ],
+          responses: { 200: { description: 'Present dates list', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { presentDates: { type: 'array', items: { type: 'string', format: 'date' } } } } } } } } } },
+        },
+      },
+      '/attendance/checkin': {
+        post: {
+          tags: ['Member Portal'],
+          summary: 'Member self check-in (mobile app)',
+          description: 'Marks attendance for the logged-in member for today. Source is set to "mobile". Idempotent — returns already_marked=true if already done today.',
+          responses: {
+            200: {
+              description: 'Check-in result',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      success: { type: 'boolean' },
+                      data: {
+                        type: 'object',
+                        properties: {
+                          message: { type: 'string' },
+                          already_marked: { type: 'boolean' },
+                          source: { type: 'string', enum: ['mobile', 'biometric', 'staff', 'qr'] },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/attendance/qr': {
+        post: {
+          tags: ['Attendance'],
+          summary: 'QR code attendance — staff scans member QR',
+          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['member_id'], properties: { member_id: { type: 'string', format: 'uuid' } } } } } },
+          responses: { 200: { description: 'Attendance marked via QR scan' } },
+        },
+      },
+
+      // ════════════════════════════════════════════════════════════════════
+      // TASKS
+      // ════════════════════════════════════════════════════════════════════
+      '/tasks': {
+        post: {
+          tags: ['Tasks'],
+          summary: 'Create follow-up task for a member',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['member_id', 'task_type'],
+                  properties: {
+                    member_id: { type: 'string', format: 'uuid' },
+                    task_type: { type: 'string', enum: ['call', 'renewal', 'check_in'] },
+                    assigned_trainer_id: { type: 'string', format: 'uuid', nullable: true },
+                    notes: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 201: { description: 'Task created', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/Task' } } } } } } },
+        },
+        get: {
+          tags: ['Tasks'],
+          summary: 'List tasks',
+          parameters: [
+            { in: 'query', name: 'status', schema: { type: 'string', enum: ['pending', 'completed', 'cancelled'] } },
+            { in: 'query', name: 'member_id', schema: { type: 'string', format: 'uuid' } },
+            { in: 'query', name: 'assigned_trainer_id', schema: { type: 'string', format: 'uuid' } },
+          ],
+          responses: { 200: { description: 'Task list', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'array', items: { $ref: '#/components/schemas/Task' } } } } } } } },
+        },
+      },
+      '/tasks/{id}': {
+        patch: {
+          tags: ['Tasks'],
+          summary: 'Update task (status, outcome, notes)',
+          parameters: [{ in: 'path', name: 'id', required: true, schema: { type: 'string', format: 'uuid' } }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    status: { type: 'string', enum: ['completed', 'cancelled'] },
+                    outcome: { type: 'string' },
+                    notes: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: 'Task updated' } },
+        },
+      },
+
+      // ════════════════════════════════════════════════════════════════════
+      // PAYMENTS (Owner)
+      // ════════════════════════════════════════════════════════════════════
+      '/payments': {
+        get: {
+          tags: ['Payments (Owner)'],
+          summary: 'List all gym payments',
+          parameters: [
+            { in: 'query', name: 'month', schema: { type: 'string', pattern: '^\\d{4}-\\d{2}$' } },
+            { in: 'query', name: 'member_id', schema: { type: 'string', format: 'uuid' } },
+            { in: 'query', name: 'page', schema: { type: 'integer', default: 1 } },
+            { in: 'query', name: 'limit', schema: { type: 'integer', default: 50 } },
+          ],
+          responses: { 200: { description: 'Payment list with total revenue', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { payments: { type: 'array', items: { $ref: '#/components/schemas/Payment' } }, total: { type: 'integer' }, total_amount: { type: 'number' } } } } } } } } },
+        },
+      },
+
+      // ════════════════════════════════════════════════════════════════════
+      // MEMBER PORTAL
+      // ════════════════════════════════════════════════════════════════════
+      '/customer/profile': {
+        get: {
+          tags: ['Member Portal'],
+          summary: 'Get logged-in member profile',
+          description: 'Returns member details, gym info, plan info, and payment_enabled flag. Includes email_verified and phone_verified badges.',
+          responses: { 200: { description: 'Member profile', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { $ref: '#/components/schemas/CustomerProfile' } } } } } } },
+        },
+        put: {
+          tags: ['Member Portal'],
+          summary: 'Update own profile (name, email)',
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { type: 'object', required: ['name'], properties: { name: { type: 'string', minLength: 2 }, email: { type: 'string', format: 'email' } } } } },
+          },
+          responses: { 200: { description: 'Profile updated' } },
+        },
+      },
+      '/customer/attendance': {
+        get: {
+          tags: ['Member Portal'],
+          summary: 'Get own attendance for a month',
+          parameters: [
+            { in: 'query', name: 'year', required: true, schema: { type: 'integer', example: 2026 } },
+            { in: 'query', name: 'month', required: true, schema: { type: 'integer', example: 5 } },
+          ],
+          responses: {
+            200: {
+              description: 'Attendance records',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      success: { type: 'boolean' },
+                      data: {
+                        type: 'array',
+                        items: {
+                          type: 'object',
+                          properties: {
+                            date: { type: 'string', format: 'date' },
+                            status: { type: 'string', enum: ['present'] },
+                            source: { type: 'string', enum: ['mobile', 'biometric', 'staff', 'qr'] },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/customer/payments': {
+        get: {
+          tags: ['Member Portal'],
+          summary: 'Get own payment history',
+          parameters: [
+            { in: 'query', name: 'page', schema: { type: 'integer', default: 1 } },
+            { in: 'query', name: 'limit', schema: { type: 'integer', default: 20 } },
+          ],
+          responses: { 200: { description: 'Payment history', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { payments: { type: 'array', items: { $ref: '#/components/schemas/Payment' } }, total: { type: 'integer' } } } } } } } } },
+        },
+      },
+      '/payments/create-order': {
+        post: {
+          tags: ['Payments (Member)'],
+          summary: 'Create Razorpay payment order (member)',
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { type: 'object', required: ['amount'], properties: { amount: { type: 'number', description: 'Amount in rupees' }, description: { type: 'string' } } } } },
+          },
+          responses: { 200: { description: 'Razorpay order created', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', properties: { order_id: { type: 'string' }, amount: { type: 'integer', description: 'In paise' }, currency: { type: 'string' }, key_id: { type: 'string' } } } } } } } } },
+          400: { description: 'Razorpay not configured or amount invalid' },
+        },
+      },
+      '/payments/verify': {
+        post: {
+          tags: ['Payments (Member)'],
+          summary: 'Verify Razorpay payment after checkout (member)',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['razorpay_order_id', 'razorpay_payment_id', 'razorpay_signature'],
+                  properties: {
+                    razorpay_order_id: { type: 'string' },
+                    razorpay_payment_id: { type: 'string' },
+                    razorpay_signature: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: 'Payment verified, membership updated' } },
+        },
+      },
+
+      // ════════════════════════════════════════════════════════════════════
+      // BIOMETRIC
+      // ════════════════════════════════════════════════════════════════════
+      '/biometric/devices': {
+        get: {
+          tags: ['Biometric'],
+          summary: 'List registered biometric devices',
+          responses: { 200: { description: 'Device list' } },
+        },
+        post: {
+          tags: ['Biometric'],
+          summary: 'Register a new biometric device by serial number',
+          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['serial_number'], properties: { serial_number: { type: 'string', example: 'ZKDEV001' }, device_name: { type: 'string' } } } } } },
+          responses: { 201: { description: 'Device registered' } },
+        },
+      },
+      '/biometric/devices/{id}': {
+        delete: {
+          tags: ['Biometric'],
+          summary: 'Remove a biometric device',
+          parameters: [{ in: 'path', name: 'id', required: true, schema: { type: 'string', format: 'uuid' } }],
+          responses: { 200: { description: 'Deleted' } },
+        },
+      },
+      '/biometric/mappings': {
+        get: {
+          tags: ['Biometric'],
+          summary: 'List device user ID → member mappings',
+          parameters: [{ in: 'query', name: 'serial', schema: { type: 'string' } }],
+          responses: { 200: { description: 'Mapping list' } },
+        },
+        put: {
+          tags: ['Biometric'],
+          summary: 'Map or update a device user ID to a member',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['serial_number', 'device_user_id'],
+                  properties: {
+                    serial_number: { type: 'string' },
+                    device_user_id: { type: 'string' },
+                    member_id: { type: 'string', format: 'uuid', nullable: true },
+                  },
+                },
+              },
+            },
+          },
+          responses: { 200: { description: 'Mapping updated' } },
+        },
+      },
+
+      // ════════════════════════════════════════════════════════════════════
+      // PROFILE
+      // ════════════════════════════════════════════════════════════════════
+      '/profile': {
+        get: {
+          tags: ['Profile'],
+          summary: 'Get logged-in user profile (owner/trainer)',
+          responses: { 200: { description: 'User profile with gym info' } },
+        },
+        put: {
+          tags: ['Profile'],
+          summary: 'Update own profile',
+          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { name: { type: 'string' }, phone: { type: 'string' }, email: { type: 'string' } } } } } },
+          responses: { 200: { description: 'Updated' } },
+        },
+      },
+      '/profile/change-password': {
+        post: {
+          tags: ['Profile'],
+          summary: 'Change own password',
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema: { type: 'object', required: ['current_password', 'new_password'], properties: { current_password: { type: 'string' }, new_password: { type: 'string', minLength: 8 } } } } },
+          },
+          responses: { 200: { description: 'Password changed' }, 400: { description: 'Wrong current password' } },
+        },
+      },
+
+      // ════════════════════════════════════════════════════════════════════
+      // ADMIN (Super-admin / Platform)
+      // ════════════════════════════════════════════════════════════════════
+      '/admin/gyms': {
+        get: {
+          tags: ['Admin'],
+          summary: 'List all gyms on the platform',
+          description: 'Requires X-Admin-Key header.',
+          parameters: [{ in: 'header', name: 'X-Admin-Key', required: true, schema: { type: 'string' } }],
+          responses: { 200: { description: 'Gym list with subscription status' } },
+        },
+      },
+      '/admin/gyms/{gymId}/block': {
+        post: {
+          tags: ['Admin'],
+          summary: 'Block / unblock a gym',
+          parameters: [
+            { in: 'header', name: 'X-Admin-Key', required: true, schema: { type: 'string' } },
+            { in: 'path', name: 'gymId', required: true, schema: { type: 'string', format: 'uuid' } },
+          ],
+          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['block'], properties: { block: { type: 'boolean' }, reason: { type: 'string' } } } } } },
+          responses: { 200: { description: 'Gym blocked/unblocked' } },
+        },
+      },
+      '/admin/gyms/{gymId}/subscription': {
+        put: {
+          tags: ['Admin'],
+          summary: 'Override gym subscription status',
+          parameters: [
+            { in: 'header', name: 'X-Admin-Key', required: true, schema: { type: 'string' } },
+            { in: 'path', name: 'gymId', required: true, schema: { type: 'string', format: 'uuid' } },
+          ],
+          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['status'], properties: { status: { type: 'string', enum: ['trial', 'active', 'suspended', 'cancelled'] } } } } } },
+          responses: { 200: { description: 'Subscription updated' } },
         },
       },
     },
