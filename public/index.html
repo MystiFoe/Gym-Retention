@@ -43,13 +43,14 @@
   -->
   <script>
     (async () => {
-      if ("serviceWorker" in navigator) {
+      if ('serviceWorker' in navigator) {
         const regs = await navigator.serviceWorker.getRegistrations();
         await Promise.all(regs.map(r => r.unregister()));
       }
-      const s = document.createElement("script");
-      s.src = "flutter_bootstrap.js";
-      document.head.appendChild(s);
+      const s = document.createElement('script');
+      s.src = 'flutter_bootstrap.js';
+      s.async = true;
+      document.body.appendChild(s);
     })();
   </script>
 </body>

@@ -26,6 +26,11 @@
         "region": "asia-south1"
       },
       {
+        "source": "/iclock/**",
+        "function": "api",
+        "region": "asia-south1"
+      },
+      {
         "source": "/admin",
         "destination": "/admin.html"
       },
