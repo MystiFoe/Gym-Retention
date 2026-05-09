@@ -1405,10 +1405,22 @@ app.post('/api/auth/login', authLimiter, validate(loginSchema), async (req: Auth
       let memberId: string | undefined;
       if (user.role === 'member') {
         const memberInfo = await client.query(
-          `SELECT id FROM members WHERE (user_id = $1 OR email = $2) AND gym_id = $3 AND is_deleted = false LIMIT 1`,
-          [user.id, user.phone_or_email, user.gym_id]
+          `SELECT id FROM members
+           WHERE gym_id = $1 AND is_deleted = false
+             AND (user_id = $2
+                  OR LOWER(email) = LOWER($3)
+                  OR phone = $3
+                  OR RIGHT(phone, 10) = RIGHT($3, 10))
+           LIMIT 1`,
+          [user.gym_id, user.id, user.phone_or_email]
         );
         memberId = memberInfo.rows[0]?.id;
+        if (memberId) {
+          client.query(
+            `UPDATE members SET user_id = $1 WHERE id = $2 AND user_id IS NULL`,
+            [user.id, memberId]
+          ).catch(() => {});
+        }
       }
 
       const accessToken = jwt.sign(
@@ -3732,11 +3744,7 @@ app.post('/api/attendance/qr', authenticate, authorize(['owner', 'trainer']), as
 app.post('/api/attendance/checkin', authenticate, authorize(['member']), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const today = new Date().toISOString().split('T')[0];
-    let memberIdParam = req.user.member_id;
-    if (!memberIdParam) {
-      const lookup = await pool.query(`SELECT id FROM members WHERE user_id = $1 AND gym_id = $2 AND is_deleted = false LIMIT 1`, [req.user.id, req.gym_id]);
-      memberIdParam = lookup.rows[0]?.id;
-    }
+    let memberIdParam = req.user.member_id ?? await resolveMemberId(req.user.id, req.gym_id!);
     if (!memberIdParam) return res.status(404).json({ success: false, error: 'Member profile not found' });
 
     const existing = await pool.query(
@@ -3767,15 +3775,7 @@ app.post('/api/attendance/checkin', authenticate, authorize(['member']), async (
 
 app.get('/api/customer/profile', authenticate, authorize(['member']), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    // If member_id not in JWT (legacy token), fall back to looking up by user.id
-    let memberIdParam = req.user.member_id;
-    if (!memberIdParam) {
-      const lookup = await pool.query(
-        `SELECT id FROM members WHERE (user_id = $1 OR email = $2) AND gym_id = $3 AND is_deleted = false LIMIT 1`,
-        [req.user.id, req.user.phone_or_email, req.gym_id]
-      );
-      memberIdParam = lookup.rows[0]?.id;
-    }
+    let memberIdParam = req.user.member_id ?? await resolveMemberId(req.user.id, req.gym_id!);
     if (!memberIdParam) return res.status(404).json({ success: false, error: 'Profile not found' });
 
     const result = await pool.query(
@@ -3799,11 +3799,7 @@ app.put('/api/customer/profile', authenticate, authorize(['member']), async (req
   try {
     const { name, email } = req.body;
     if (!name || name.trim().length < 2) return res.status(400).json({ success: false, error: 'Name must be at least 2 characters' });
-    let memberIdParam = req.user.member_id;
-    if (!memberIdParam) {
-      const lookup = await pool.query(`SELECT id FROM members WHERE user_id = $1 AND gym_id = $2 AND is_deleted = false LIMIT 1`, [req.user.id, req.gym_id]);
-      memberIdParam = lookup.rows[0]?.id;
-    }
+    let memberIdParam = req.user.member_id ?? await resolveMemberId(req.user.id, req.gym_id!);
     if (!memberIdParam) return res.status(404).json({ success: false, error: 'Profile not found' });
     await pool.query(
       `UPDATE members SET name = $1, email = $2 WHERE id = $3 AND gym_id = $4 AND is_deleted = false`,
@@ -3817,11 +3813,7 @@ app.get('/api/customer/attendance', authenticate, authorize(['member']), async (
   try {
     const year  = parseInt((req.query.year  as string) || `${new Date().getFullYear()}`);
     const month = parseInt((req.query.month as string) || `${new Date().getMonth() + 1}`);
-    let memberIdParam = req.user.member_id;
-    if (!memberIdParam) {
-      const lookup = await pool.query(`SELECT id FROM members WHERE user_id = $1 AND gym_id = $2 AND is_deleted = false LIMIT 1`, [req.user.id, req.gym_id]);
-      memberIdParam = lookup.rows[0]?.id;
-    }
+    let memberIdParam = req.user.member_id ?? await resolveMemberId(req.user.id, req.gym_id!);
     if (!memberIdParam) return res.json({ success: true, data: [] });
     const result = await pool.query(
       `SELECT DATE(visited_at)::text AS date, status, COALESCE(source, 'staff') AS source
@@ -3840,6 +3832,32 @@ app.get('/api/customer/attendance', authenticate, authorize(['member']), async (
 // ============================================================================
 // PAYMENT ENDPOINTS
 // ============================================================================
+
+// Resolve member_id from JWT user — JOIN through users table so email/phone match works
+// even when members.user_id is NULL (manually-added members). Also auto-links user_id.
+async function resolveMemberId(userId: string, gymId: string): Promise<string | undefined> {
+  try {
+    const lookup = await pool.query(
+      `SELECT m.id FROM members m
+       JOIN users u ON u.id = $1
+       WHERE m.gym_id = $2 AND m.is_deleted = false
+         AND (m.user_id = u.id
+              OR LOWER(m.email) = LOWER(u.phone_or_email)
+              OR m.phone = u.phone_or_email
+              OR RIGHT(m.phone, 10) = RIGHT(u.phone_or_email, 10))
+       LIMIT 1`,
+      [userId, gymId]
+    );
+    const memberId = lookup.rows[0]?.id;
+    if (memberId) {
+      pool.query(
+        `UPDATE members SET user_id = $1 WHERE id = $2 AND user_id IS NULL`,
+        [userId, memberId]
+      ).catch(() => {});
+    }
+    return memberId;
+  } catch { return undefined; }
+}
 
 async function razorpayRequest(gymId: string, path: string, method: string, body?: any): Promise<{ data: any; keyId: string }> {
   const gymRes = await pool.query(`SELECT razorpay_key_id, razorpay_key_secret FROM gyms WHERE id = $1`, [gymId]);
@@ -3917,11 +3935,7 @@ app.get('/api/customer/payments', authenticate, authorize(['member']), async (re
     const page = Math.max(1, parseInt((req.query.page as string) || '1'));
     const limit = Math.min(parseInt((req.query.limit as string) || '20'), 50);
     const offset = (page - 1) * limit;
-    let memberIdParam = req.user.member_id;
-    if (!memberIdParam) {
-      const lookup = await pool.query(`SELECT id FROM members WHERE user_id = $1 AND gym_id = $2 AND is_deleted = false LIMIT 1`, [req.user.id, req.gym_id]);
-      memberIdParam = lookup.rows[0]?.id;
-    }
+    let memberIdParam = req.user.member_id ?? await resolveMemberId(req.user.id, req.gym_id!);
     if (!memberIdParam) return res.json({ success: true, data: { payments: [], total: 0 } });
     const rows = await pool.query(
       `SELECT id, amount, currency, status, payment_method, description, created_at
