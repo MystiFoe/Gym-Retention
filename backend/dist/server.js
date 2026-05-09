@@ -534,6 +534,9 @@ const bulkTrainersSchema = zod_1.z.object({
 // EXPRESS APP
 // ============================================================================
 const app = (0, express_1.default)();
+// Trust the first proxy (Firebase Functions / Cloud Run sit behind a load balancer).
+// This lets express-rate-limit use X-Forwarded-For for the real client IP.
+app.set('trust proxy', 1);
 app.use((0, helmet_1.default)());
 app.use((0, cors_1.default)({
     origin: (process.env.CORS_ORIGIN || '*').split(',').map(o => o.trim()),
@@ -731,21 +734,27 @@ const errorHandler = (err, req, res, next) => {
 // ============================================================================
 // SWAGGER API DOCS
 // ============================================================================
-app.use('/api-docs', swagger_ui_express_1.default.serve, swagger_ui_express_1.default.setup(swagger_1.default, {
+const swaggerSetup = swagger_ui_express_1.default.setup(swagger_1.default, {
     customSiteTitle: 'Recurva API Docs',
     swaggerOptions: { persistAuthorization: true },
-}));
+});
+app.use('/api-docs', swagger_ui_express_1.default.serve, swaggerSetup);
+// Also serve under /api/docs so Firebase Hosting rewrite /api/** reaches it
+app.use('/api/docs', swagger_ui_express_1.default.serve, swaggerSetup);
 // ============================================================================
 // HEALTH & METRICS
 // ============================================================================
-app.get('/health', (req, res) => {
+const healthHandler = (req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
+        version: '3.0.0',
         uptime: process.uptime(),
         environment: process.env.NODE_ENV
     });
-});
+};
+app.get('/health', healthHandler);
+app.get('/api/health', healthHandler);
 app.get('/metrics', (req, res) => {
     res.set('Content-Type', prom_client_1.default.register.contentType);
     res.end(prom_client_1.default.register.metrics());

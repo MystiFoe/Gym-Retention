@@ -586,6 +586,10 @@ const bulkTrainersSchema = z.object({
 
 const app: Express = express();
 
+// Trust the first proxy (Firebase Functions / Cloud Run sit behind a load balancer).
+// This lets express-rate-limit use X-Forwarded-For for the real client IP.
+app.set('trust proxy', 1);
+
 app.use(helmet());
 app.use(cors({
   origin: (process.env.CORS_ORIGIN || '*').split(',').map(o => o.trim()),
@@ -796,23 +800,30 @@ const errorHandler = (err: CustomError, req: Request, res: Response, next: NextF
 // SWAGGER API DOCS
 // ============================================================================
 
-app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
+const swaggerSetup = swaggerUi.setup(swaggerSpec, {
   customSiteTitle: 'Recurva API Docs',
   swaggerOptions: { persistAuthorization: true },
-}));
+});
+app.use('/api-docs', swaggerUi.serve, swaggerSetup);
+// Also serve under /api/docs so Firebase Hosting rewrite /api/** reaches it
+app.use('/api/docs', swaggerUi.serve, swaggerSetup);
 
 // ============================================================================
 // HEALTH & METRICS
 // ============================================================================
 
-app.get('/health', (req: Request, res: Response) => {
+const healthHandler = (req: Request, res: Response) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
+    version: '3.0.0',
     uptime: process.uptime(),
     environment: process.env.NODE_ENV
   });
-});
+};
+
+app.get('/health', healthHandler);
+app.get('/api/health', healthHandler);
 
 app.get('/metrics', (req: Request, res: Response) => {
   res.set('Content-Type', prometheus.register.contentType);

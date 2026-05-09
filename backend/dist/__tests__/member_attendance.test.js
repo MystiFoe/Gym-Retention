@@ -16,33 +16,33 @@ process.env.JWT_SECRET = 'test_jwt_secret_must_be_at_least_32_chars_ok';
 process.env.JWT_REFRESH_SECRET = 'test_refresh_secret_must_be_32_chars_ok!!';
 process.env.CORS_ORIGIN = '*';
 process.env.NODE_ENV = 'test';
-process.env.PORT = '0'; // bind to random port
-// ─── Mock @sentry/node first — it pulls in @fastify/otel which has broken ────
-// sub-dependencies in this environment. Stub just what server.ts uses.
+process.env.PORT = '0';
 jest.mock('@sentry/node', () => ({
     init: jest.fn(),
     captureException: jest.fn(),
     captureMessage: jest.fn(),
 }));
-// ─── Mock pg — attach the shared query mock to the Pool constructor so we ────
-// can retrieve it after the factory runs (avoids hoisting TDZ issues).
-jest.mock('pg', () => {
-    const mockQuery = jest.fn();
-    const MockPool = jest.fn().mockImplementation(() => ({
-        connect: jest.fn().mockImplementation(() => Promise.resolve({ query: mockQuery, release: jest.fn() })),
-        query: jest.fn().mockResolvedValue({ rows: [] }),
+// Single shared mockQuery handles both pool.query AND client.query via pool.connect()
+const mockQuery = jest.fn().mockResolvedValue({ rows: [], rowCount: 0 });
+jest.mock('pg', () => ({
+    Pool: jest.fn().mockImplementation(() => ({
+        connect: jest.fn().mockResolvedValue({ query: mockQuery, release: jest.fn() }),
+        query: mockQuery,
         end: jest.fn(),
-        on: jest.fn(), // pool.on('error', ...) in server.ts
-    }));
-    MockPool._query = mockQuery; // store for retrieval in tests
-    return { Pool: MockPool };
-});
-// ─── Silence other side-effect modules ───────────────────────────────────────
+        on: jest.fn(),
+    })),
+}));
 jest.mock('node-cron', () => ({ schedule: jest.fn() }));
 jest.mock('nodemailer', () => ({
     createTransport: jest.fn().mockReturnValue({ sendMail: jest.fn().mockResolvedValue({}) }),
 }));
 jest.mock('razorpay', () => jest.fn().mockImplementation(() => ({})));
+jest.mock('firebase-admin', () => ({
+    initializeApp: jest.fn(),
+    credential: { cert: jest.fn() },
+    auth: jest.fn().mockReturnValue({ verifyIdToken: jest.fn() }),
+    messaging: jest.fn().mockReturnValue({ send: jest.fn().mockResolvedValue('') }),
+}));
 jest.mock('prom-client', () => ({
     collectDefaultMetrics: jest.fn(),
     register: {
@@ -88,34 +88,31 @@ const MOCK_MEMBER = {
     created_at: '2026-01-01T00:00:00.000Z',
     assigned_trainer_id: null,
 };
-// ─── App + mock references (populated in beforeAll) ───────────────────────────
+// ─── App (populated in beforeAll) ───────────────────────────────────────────
 let app;
-let mockQuery;
 beforeAll(() => {
-    // Require server after all mocks are registered
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const mod = require('../server');
-    app = mod.default;
-    // Retrieve the shared query mock that the pg factory attached to Pool
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { Pool } = jest.requireMock('pg');
-    mockQuery = Pool._query;
+    app = require('../server').default;
 });
 afterEach(() => {
-    // Reset queued responses; Pool.connect still returns { query: mockQuery } via factory closure
     mockQuery.mockReset();
+    // Always return a default resolved value so startup-like calls still work
+    mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
 });
 // ─── Helper: queue multiple DB result sets in call order ─────────────────────
+// Each call to setupQueries() enqueues responses for pool.query AND client.query
+// because both use the same shared mockQuery.
+// The authenticate middleware calls pool.query({ gym_id }) → must return is_blocked row.
 function setupQueries(...rowSets) {
     for (const rows of rowSets) {
-        mockQuery.mockResolvedValueOnce({ rows });
+        mockQuery.mockResolvedValueOnce({ rows, rowCount: rows.length });
     }
 }
 // ─── Tests ────────────────────────────────────────────────────────────────────
 describe('GET /api/members/:memberId/attendance', () => {
     // 1 ── Owner gets member details + present dates ────────────────────────────
     it('200: returns member + present_dates for owner', async () => {
-        setupQueries([MOCK_MEMBER], [{ visit_date: '2026-04-05' }, { visit_date: '2026-04-10' }, { visit_date: '2026-04-14' }]);
+        setupQueries([{ is_blocked: false }], // authenticate: gym block check
+        [MOCK_MEMBER], [{ visit_date: '2026-04-05' }, { visit_date: '2026-04-10' }, { visit_date: '2026-04-14' }]);
         const res = await (0, supertest_1.default)(app)
             .get(`/api/members/${MEMBER_ID}/attendance?month=2026-04`)
             .set('Authorization', `Bearer ${OWNER_TOKEN}`);
@@ -128,7 +125,7 @@ describe('GET /api/members/:memberId/attendance', () => {
     });
     // 2 ── No attendance this month → empty array ──────────────────────────────
     it('200: returns empty present_dates when member has no attendance', async () => {
-        setupQueries([MOCK_MEMBER], []);
+        setupQueries([{ is_blocked: false }], [MOCK_MEMBER], []);
         const res = await (0, supertest_1.default)(app)
             .get(`/api/members/${MEMBER_ID}/attendance?month=2026-02`)
             .set('Authorization', `Bearer ${OWNER_TOKEN}`);
@@ -138,7 +135,8 @@ describe('GET /api/members/:memberId/attendance', () => {
     });
     // 3 ── Member not in gym → 404 ─────────────────────────────────────────────
     it('404: member does not exist in the gym', async () => {
-        setupQueries([]); // empty member result
+        setupQueries([{ is_blocked: false }], [] // empty member result
+        );
         const res = await (0, supertest_1.default)(app)
             .get(`/api/members/nonexistent-id/attendance?month=2026-04`)
             .set('Authorization', `Bearer ${OWNER_TOKEN}`);
@@ -161,6 +159,7 @@ describe('GET /api/members/:memberId/attendance', () => {
     });
     // 6 ── Member role → 403 ───────────────────────────────────────────────────
     it('403: member role is not authorised', async () => {
+        setupQueries([{ is_blocked: false }]); // gym check succeeds, then authorize fails
         const res = await (0, supertest_1.default)(app)
             .get(`/api/members/${MEMBER_ID}/attendance?month=2026-04`)
             .set('Authorization', `Bearer ${MEMBER_TOKEN}`);
@@ -168,7 +167,7 @@ describe('GET /api/members/:memberId/attendance', () => {
     });
     // 7 ── Trainer can access their assigned member ────────────────────────────
     it('200: trainer can view their assigned member attendance', async () => {
-        setupQueries([{ id: TRAINER_ID }], // trainer profile lookup
+        setupQueries([{ is_blocked: false }], [{ id: TRAINER_ID }], // trainer profile lookup
         [{ ...MOCK_MEMBER, assigned_trainer_id: TRAINER_ID }], // member
         [{ visit_date: '2026-04-07' }] // attendance
         );
@@ -183,7 +182,7 @@ describe('GET /api/members/:memberId/attendance', () => {
     it('200: defaults to current month when month param is omitted', async () => {
         const now = new Date();
         const expected = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-        setupQueries([MOCK_MEMBER], []);
+        setupQueries([{ is_blocked: false }], [MOCK_MEMBER], []);
         const res = await (0, supertest_1.default)(app)
             .get(`/api/members/${MEMBER_ID}/attendance`)
             .set('Authorization', `Bearer ${OWNER_TOKEN}`);
@@ -194,7 +193,7 @@ describe('GET /api/members/:memberId/attendance', () => {
     it('200: invalid month format falls back to current month', async () => {
         const now = new Date();
         const expected = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-        setupQueries([MOCK_MEMBER], []);
+        setupQueries([{ is_blocked: false }], [MOCK_MEMBER], []);
         const res = await (0, supertest_1.default)(app)
             .get(`/api/members/${MEMBER_ID}/attendance?month=not-a-month`)
             .set('Authorization', `Bearer ${OWNER_TOKEN}`);
@@ -203,7 +202,7 @@ describe('GET /api/members/:memberId/attendance', () => {
     });
     // 10 ── Response shape has all required fields ─────────────────────────────
     it('200: response shape contains all required member fields', async () => {
-        setupQueries([MOCK_MEMBER], []);
+        setupQueries([{ is_blocked: false }], [MOCK_MEMBER], []);
         const res = await (0, supertest_1.default)(app)
             .get(`/api/members/${MEMBER_ID}/attendance?month=2026-04`)
             .set('Authorization', `Bearer ${OWNER_TOKEN}`);
