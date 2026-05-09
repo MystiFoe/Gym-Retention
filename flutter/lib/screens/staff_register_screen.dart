@@ -1,6 +1,9 @@
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import '../services/api_service.dart';
+import '../services/firebase_service.dart';
 import '../models/models.dart';
 import '../utils/app_utils.dart';
 import '../utils/app_routes.dart';
@@ -15,7 +18,7 @@ class StaffRegisterScreen extends StatefulWidget {
 }
 
 class _StaffRegisterScreenState extends State<StaffRegisterScreen> {
-  // Step 1 = enter invite code, Step 2 = fill details
+  // Step 1 = invite code, Step 2 = fill details, Step 3 = phone OTP, Step 4 = email OTP
   int _step = 1;
 
   final _codeController     = TextEditingController();
@@ -35,6 +38,22 @@ class _StaffRegisterScreenState extends State<StaffRegisterScreen> {
   String? _phoneError;
   String? _passwordError;
 
+  // Phone OTP state
+  String? _verificationId;
+  String? _firebaseIdToken;
+  final _phoneOtpController = TextEditingController();
+  bool _phoneSending = false;
+  bool _phoneVerifying = false;
+  String? _phoneOtpError;
+
+  // Email OTP state
+  String? _emailTempKey;
+  final _emailOtpController = TextEditingController();
+  bool _emailSending = false;
+  bool _emailVerifying = false;
+  String? _emailOtpError;
+  String? _emailOtpSuccess;
+
   @override
   void dispose() {
     _codeController.dispose();
@@ -42,6 +61,8 @@ class _StaffRegisterScreenState extends State<StaffRegisterScreen> {
     _emailController.dispose();
     _phoneController.dispose();
     _passwordController.dispose();
+    _phoneOtpController.dispose();
+    _emailOtpController.dispose();
     super.dispose();
   }
 
@@ -67,7 +88,7 @@ class _StaffRegisterScreenState extends State<StaffRegisterScreen> {
     }
   }
 
-  Future<void> _register() async {
+  Future<void> _goToPhoneVerification() async {
     setState(() {
       _nameError     = AppUtils.validateName(_nameController.text);
       _emailError    = AppUtils.validateEmail(_emailController.text);
@@ -75,17 +96,92 @@ class _StaffRegisterScreenState extends State<StaffRegisterScreen> {
       _passwordError = AppUtils.validatePassword(_passwordController.text);
     });
     if (_nameError != null || _emailError != null || _phoneError != null || _passwordError != null) return;
+    setState(() { _step = 3; _phoneOtpError = null; _verificationId = null; _firebaseIdToken = null; });
+    await _sendPhoneOtp();
+  }
 
+  Future<void> _sendPhoneOtp() async {
+    final phone = _phoneController.text.trim();
+    final e164 = phone.startsWith('+') ? phone : '+91$phone';
+    setState(() { _phoneSending = true; _phoneOtpError = null; });
+    try {
+      final result = await FirebaseService().sendOtp(e164);
+      if (!mounted) return;
+      if (result.autoVerified && result.idToken != null) {
+        setState(() { _firebaseIdToken = result.idToken; _phoneSending = false; });
+        await _afterPhoneVerified();
+      } else {
+        setState(() { _verificationId = result.verificationId; _phoneSending = false; });
+      }
+    } on FirebaseAuthException catch (e) {
+      if (mounted) setState(() { _phoneSending = false; _phoneOtpError = _friendlyFirebaseError(e); });
+    } catch (_) {
+      if (mounted) setState(() { _phoneSending = false; _phoneOtpError = 'Failed to send OTP. Check number and try again.'; });
+    }
+  }
+
+  Future<void> _verifyPhoneCode() async {
+    final code = _phoneOtpController.text.trim();
+    if (code.length != 6) { setState(() => _phoneOtpError = 'Enter the 6-digit code'); return; }
+    if (_verificationId == null) return;
+    setState(() { _phoneVerifying = true; _phoneOtpError = null; });
+    try {
+      final token = await FirebaseService().verifyOtp(verificationId: _verificationId!, smsCode: code);
+      if (!mounted) return;
+      setState(() { _firebaseIdToken = token; _phoneVerifying = false; });
+      await _afterPhoneVerified();
+    } on FirebaseAuthException catch (e) {
+      if (mounted) setState(() { _phoneVerifying = false; _phoneOtpError = _friendlyFirebaseError(e); });
+    } catch (e) {
+      if (mounted) setState(() { _phoneVerifying = false; _phoneOtpError = e.toString().replaceFirst('Exception: ', ''); });
+    }
+  }
+
+  Future<void> _afterPhoneVerified() async {
+    // Move to email OTP step and send OTP
+    setState(() { _step = 4; _emailOtpError = null; _emailTempKey = null; });
+    await _sendEmailOtp();
+  }
+
+  Future<void> _sendEmailOtp() async {
+    setState(() { _emailSending = true; _emailOtpError = null; _emailOtpSuccess = null; });
+    try {
+      final result = await ApiService().memberSendEmailOtp(
+        code: _codeController.text.trim().toUpperCase(),
+        email: _emailController.text.trim(),
+      );
+      if (!mounted) return;
+      setState(() { _emailTempKey = result['tempKey'] as String?; _emailSending = false; _emailOtpSuccess = 'OTP sent to ${_emailController.text.trim()}'; });
+    } catch (e) {
+      if (mounted) setState(() { _emailSending = false; _emailOtpError = e.toString().replaceFirst('Exception: ', ''); });
+    }
+  }
+
+  Future<void> _verifyEmailAndRegister() async {
+    final otp = _emailOtpController.text.trim();
+    if (otp.length != 6) { setState(() => _emailOtpError = 'Enter the 6-digit code'); return; }
+    setState(() { _emailVerifying = true; _emailOtpError = null; });
+    try {
+      await _register(emailOtpKey: _emailTempKey, emailOtp: otp, firebaseIdToken: _firebaseIdToken);
+    } catch (e) {
+      if (mounted) setState(() { _emailVerifying = false; _emailOtpError = e.toString().replaceFirst('Exception: ', ''); });
+    }
+  }
+
+  Future<void> _register({String? emailOtpKey, String? emailOtp, String? firebaseIdToken}) async {
     setState(() { _loading = true; _error = null; });
     try {
       final isMember = _inviteInfo?.type == 'member';
       if (isMember) {
         await ApiService().memberSelfRegister(
-          code:     _codeController.text.trim().toUpperCase(),
-          name:     _nameController.text.trim(),
-          email:    _emailController.text.trim(),
-          phone:    _phoneController.text.trim(),
-          password: _passwordController.text,
+          code:            _codeController.text.trim().toUpperCase(),
+          name:            _nameController.text.trim(),
+          email:           _emailController.text.trim(),
+          phone:           _phoneController.text.trim(),
+          password:        _passwordController.text,
+          emailOtpKey:     emailOtpKey,
+          emailOtp:        emailOtp,
+          firebaseIdToken: firebaseIdToken,
         );
         if (!mounted) return;
         authNotifier.update(true, role: 'member');
@@ -110,7 +206,18 @@ class _StaffRegisterScreenState extends State<StaffRegisterScreen> {
         context.go(destination);
       }
     } catch (e) {
-      setState(() { _error = e.toString().replaceFirst('Exception: ', ''); _loading = false; });
+      setState(() { _error = e.toString().replaceFirst('Exception: ', ''); _loading = false; _emailVerifying = false; });
+    }
+  }
+
+  String _friendlyFirebaseError(FirebaseAuthException e) {
+    switch (e.code) {
+      case 'invalid-phone-number':       return 'Invalid phone number. Include country code (e.g. +91).';
+      case 'too-many-requests':          return 'Too many attempts. Please try again later.';
+      case 'invalid-verification-code':  return 'Wrong code. Please check and try again.';
+      case 'session-expired':            return 'OTP expired. Tap Resend.';
+      case 'quota-exceeded':             return 'SMS quota exceeded. Try again later.';
+      default: return e.message ?? 'An error occurred. Please try again.';
     }
   }
 
@@ -118,23 +225,51 @@ class _StaffRegisterScreenState extends State<StaffRegisterScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Staff Registration'),
-        leading: BackButton(onPressed: () {
-          if (_step == 2) {
-            setState(() { _step = 1; _inviteInfo = null; _error = null; });
-          } else {
-            context.go(RoutePaths.login);
-          }
-        }),
+        title: Text(_appBarTitle),
+        leading: BackButton(onPressed: _onBack),
       ),
       body: SafeArea(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
-          child: _step == 1 ? _buildCodeStep() : _buildDetailsStep(),
+          child: _buildCurrentStep(),
         ),
       ),
     );
   }
+
+  String get _appBarTitle {
+    switch (_step) {
+      case 1: return 'Register with Code';
+      case 2: return 'Create Account';
+      case 3: return 'Verify Phone';
+      case 4: return 'Verify Email';
+      default: return 'Register';
+    }
+  }
+
+  void _onBack() {
+    if (_step == 4) {
+      setState(() { _step = 3; _emailOtpController.clear(); _emailOtpError = null; });
+    } else if (_step == 3) {
+      setState(() { _step = 2; _phoneOtpController.clear(); _phoneOtpError = null; });
+    } else if (_step == 2) {
+      setState(() { _step = 1; _inviteInfo = null; _error = null; });
+    } else {
+      context.go(RoutePaths.login);
+    }
+  }
+
+  Widget _buildCurrentStep() {
+    switch (_step) {
+      case 1: return _buildCodeStep();
+      case 2: return _buildDetailsStep();
+      case 3: return _buildPhoneOtpStep();
+      case 4: return _buildEmailOtpStep();
+      default: return _buildCodeStep();
+    }
+  }
+
+  // ── Step 1: Invite Code ───────────────────────────────────────────────────
 
   Widget _buildCodeStep() {
     return Column(
@@ -168,15 +303,7 @@ class _StaffRegisterScreenState extends State<StaffRegisterScreen> {
         ),
         if (_error != null) ...[
           const SizedBox(height: 12),
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: Colors.red.shade50,
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: Colors.red.shade200),
-            ),
-            child: Text(_error!, style: TextStyle(color: Colors.red.shade700, fontSize: 13)),
-          ),
+          _errorBox(_error!),
         ],
         const SizedBox(height: 24),
         ElevatedButton(
@@ -193,6 +320,8 @@ class _StaffRegisterScreenState extends State<StaffRegisterScreen> {
       ],
     );
   }
+
+  // ── Step 2: Details ───────────────────────────────────────────────────────
 
   Widget _buildDetailsStep() {
     final info = _inviteInfo!;
@@ -238,7 +367,7 @@ class _StaffRegisterScreenState extends State<StaffRegisterScreen> {
         Text('Create Your Account',
             style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold)),
         const SizedBox(height: 4),
-        Text('Set your own credentials — your manager won\'t see your password.',
+        Text('Your phone and email will be verified in the next steps.',
             style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey)),
         const SizedBox(height: 20),
         TextFormField(
@@ -267,11 +396,14 @@ class _StaffRegisterScreenState extends State<StaffRegisterScreen> {
         TextFormField(
           controller: _phoneController,
           keyboardType: TextInputType.phone,
+          inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9+]'))],
           decoration: InputDecoration(
             labelText: 'Phone *',
             prefixIcon: const Icon(Icons.phone),
+            hintText: '+91 98765 43210',
             errorText: _phoneError,
             border: const OutlineInputBorder(),
+            helperText: 'Include country code, e.g. +91',
           ),
           onChanged: (v) => setState(() => _phoneError = AppUtils.validatePhoneNumber(v)),
         ),
@@ -296,24 +428,223 @@ class _StaffRegisterScreenState extends State<StaffRegisterScreen> {
             style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey)),
         if (_error != null) ...[
           const SizedBox(height: 12),
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: Colors.red.shade50,
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: Colors.red.shade200),
-            ),
-            child: Text(_error!, style: TextStyle(color: Colors.red.shade700, fontSize: 13)),
-          ),
+          _errorBox(_error!),
         ],
         const SizedBox(height: 24),
-        ElevatedButton(
-          onPressed: _loading ? null : _register,
-          child: _loading
-              ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-              : const Text('Create Account & Login'),
-        ),
+        // Staff can skip OTP (they register less often and may have limited SMS)
+        if (isMember)
+          ElevatedButton.icon(
+            onPressed: _loading ? null : _goToPhoneVerification,
+            icon: _loading
+                ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                : const Icon(Icons.verified_user),
+            label: const Text('Verify & Create Account'),
+          )
+        else
+          ElevatedButton(
+            onPressed: _loading ? null : () => _register(),
+            child: _loading
+                ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                : const Text('Create Account & Login'),
+          ),
       ],
     );
   }
+
+  // ── Step 3: Phone OTP ─────────────────────────────────────────────────────
+
+  Widget _buildPhoneOtpStep() {
+    final phone = _phoneController.text.trim();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const SizedBox(height: 24),
+        const Icon(Icons.phone_android, size: 72, color: Color(0xFF2196F3)),
+        const SizedBox(height: 20),
+        Text('Verify Your Phone',
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold, color: const Color(0xFF2196F3))),
+        const SizedBox(height: 8),
+        Text(
+          _verificationId == null && !_phoneSending
+              ? 'Sending OTP to $phone…'
+              : _phoneSending
+                  ? 'Sending OTP to $phone…'
+                  : 'Enter the 6-digit code sent to $phone',
+          textAlign: TextAlign.center,
+          style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.grey[600]),
+        ),
+        const SizedBox(height: 32),
+        if (_phoneOtpError != null) ...[
+          _errorBox(_phoneOtpError!),
+          const SizedBox(height: 16),
+        ],
+        if (_phoneSending)
+          const Center(child: CircularProgressIndicator())
+        else if (_verificationId != null) ...[
+          TextField(
+            controller: _phoneOtpController,
+            keyboardType: TextInputType.number,
+            maxLength: 6,
+            textAlign: TextAlign.center,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold, letterSpacing: 8),
+            decoration: InputDecoration(
+              labelText: '6-digit code',
+              counterText: '',
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: const BorderSide(color: Color(0xFF2196F3), width: 2),
+              ),
+            ),
+          ),
+          const SizedBox(height: 24),
+          ElevatedButton.icon(
+            onPressed: _phoneVerifying ? null : _verifyPhoneCode,
+            icon: _phoneVerifying
+                ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                : const Icon(Icons.verified),
+            label: Text(_phoneVerifying ? 'Verifying…' : 'Verify Phone',
+                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          ),
+          const SizedBox(height: 16),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text("Didn't receive it? ", style: TextStyle(color: Colors.grey[600])),
+              TextButton(
+                onPressed: _phoneSending ? null : () {
+                  setState(() { _phoneOtpController.clear(); _phoneOtpError = null; _verificationId = null; });
+                  _sendPhoneOtp();
+                },
+                child: const Text('Resend OTP'),
+              ),
+            ],
+          ),
+        ],
+      ],
+    );
+  }
+
+  // ── Step 4: Email OTP ─────────────────────────────────────────────────────
+
+  Widget _buildEmailOtpStep() {
+    final email = _emailController.text.trim();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const SizedBox(height: 24),
+        const Icon(Icons.mark_email_unread_outlined, size: 72, color: Color(0xFF2196F3)),
+        const SizedBox(height: 20),
+        Text('Verify Your Email',
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold, color: const Color(0xFF2196F3))),
+        const SizedBox(height: 8),
+        Text('Enter the 6-digit code sent to $email',
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.grey[600])),
+        const SizedBox(height: 32),
+        if (_emailOtpError != null) ...[
+          _errorBox(_emailOtpError!),
+          const SizedBox(height: 12),
+        ],
+        if (_emailOtpSuccess != null) ...[
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.green.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.green),
+            ),
+            child: Text(_emailOtpSuccess!, style: const TextStyle(color: Colors.green)),
+          ),
+          const SizedBox(height: 12),
+        ],
+        if (_emailSending)
+          const Center(child: CircularProgressIndicator())
+        else ...[
+          TextField(
+            controller: _emailOtpController,
+            keyboardType: TextInputType.number,
+            maxLength: 6,
+            textAlign: TextAlign.center,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold, letterSpacing: 8),
+            decoration: InputDecoration(
+              labelText: '6-digit code',
+              counterText: '',
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: const BorderSide(color: Color(0xFF2196F3), width: 2),
+              ),
+            ),
+            onChanged: (_) => setState(() => _emailOtpError = null),
+          ),
+          const SizedBox(height: 24),
+          ElevatedButton.icon(
+            onPressed: _emailVerifying ? null : _verifyEmailAndRegister,
+            icon: _emailVerifying
+                ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                : const Icon(Icons.check_circle),
+            label: Text(_emailVerifying ? 'Creating account…' : 'Verify & Create Account',
+                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          ),
+          const SizedBox(height: 16),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text("Didn't receive it? ", style: TextStyle(color: Colors.grey[600])),
+              TextButton(
+                onPressed: _emailSending ? null : () {
+                  setState(() { _emailOtpController.clear(); _emailOtpError = null; _emailOtpSuccess = null; });
+                  _sendEmailOtp();
+                },
+                child: const Text('Resend Code'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Step 2 of 2 — Email verification',
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey[500]),
+          ),
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.blue.withValues(alpha: 0.06),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.blue.withValues(alpha: 0.2)),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Icon(Icons.info_outline, size: 16, color: Color(0xFF2196F3)),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Check your spam folder if you don\'t see it. Code is valid for 15 minutes.',
+                    style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _errorBox(String message) => Container(
+    padding: const EdgeInsets.all(12),
+    decoration: BoxDecoration(
+      color: Colors.red.shade50,
+      borderRadius: BorderRadius.circular(8),
+      border: Border.all(color: Colors.red.shade200),
+    ),
+    child: Text(message, style: TextStyle(color: Colors.red.shade700, fontSize: 13)),
+  );
 }

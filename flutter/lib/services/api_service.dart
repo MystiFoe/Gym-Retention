@@ -970,12 +970,27 @@ class ApiService {
     return result;
   }
 
+  Future<Map<String, dynamic>> memberSendEmailOtp({
+    required String code,
+    required String email,
+  }) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/auth/member/send-email-otp'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'code': code.toUpperCase(), 'email': email}),
+    );
+    return _handleResponse(response, (data) => data as Map<String, dynamic>);
+  }
+
   Future<LoginResponse> memberSelfRegister({
     required String code,
     required String name,
     required String email,
     required String phone,
     required String password,
+    String? emailOtpKey,
+    String? emailOtp,
+    String? firebaseIdToken,
   }) async {
     final response = await http.post(
       Uri.parse('$baseUrl/auth/member/register'),
@@ -986,6 +1001,9 @@ class ApiService {
         'email': email,
         'phone': phone,
         'password': password,
+        if (emailOtpKey != null) 'emailOtpKey': emailOtpKey,
+        if (emailOtp != null) 'emailOtp': emailOtp,
+        if (firebaseIdToken != null) 'firebaseIdToken': firebaseIdToken,
       }),
     );
     final result = await _handleResponse(response, (data) => LoginResponse.fromJson(data));

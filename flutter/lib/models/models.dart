@@ -26,18 +26,21 @@ class User {
   final String id;
   final String businessId;
   final String role;
+  final String trainerRole; // 'staff' | 'admin' — only relevant when role == 'trainer'
 
   User({
     required this.id,
     required this.businessId,
     required this.role,
+    this.trainerRole = 'staff',
   });
 
   factory User.fromJson(Map<String, dynamic> json) {
     return User(
-      id: json['id'] ?? '',
-      businessId: json['gym_id'] ?? '',
-      role: json['role'] ?? '',
+      id:          json['id']           ?? '',
+      businessId:  json['gym_id']       ?? '',
+      role:        json['role']         ?? '',
+      trainerRole: json['trainer_role'] ?? 'staff',
     );
   }
 }
@@ -164,6 +167,27 @@ class RazorpayOrderResponse {
 // CUSTOMER MODELS
 // ============================================================================
 
+// Shared plan definitions — single source of truth used across all screens
+class MemberPlan {
+  final String key;
+  final String label;
+  final int months;
+  const MemberPlan({required this.key, required this.label, required this.months});
+}
+
+const List<MemberPlan> kMemberPlans = [
+  MemberPlan(key: 'monthly',   label: '1 Month',  months: 1),
+  MemberPlan(key: 'quarterly', label: '3 Months', months: 3),
+  MemberPlan(key: 'biannual',  label: '6 Months', months: 6),
+  MemberPlan(key: 'annual',    label: '1 Year',   months: 12),
+];
+
+String planLabel(String? key) {
+  if (key == null) return '—';
+  return kMemberPlans.firstWhere((p) => p.key == key,
+      orElse: () => MemberPlan(key: key, label: key, months: 1)).label;
+}
+
 class Customer {
   final String id;
   final String name;
@@ -172,9 +196,11 @@ class Customer {
   final DateTime? lastVisitDate;
   final DateTime subscriptionEndDate;
   final double planFee;
+  final String? plan;   // 'monthly' | 'quarterly' | 'biannual' | 'annual'
   final String status;
   final DateTime createdAt;
   final String? assignedStaffId;
+  final String? displayId; // e.g. RCV-M-0000001
 
   Customer({
     required this.id,
@@ -184,10 +210,14 @@ class Customer {
     this.lastVisitDate,
     required this.subscriptionEndDate,
     required this.planFee,
+    this.plan,
     required this.status,
     required this.createdAt,
     this.assignedStaffId,
+    this.displayId,
   });
+
+  String get planDisplay => planLabel(plan);
 
   factory Customer.fromJson(Map<String, dynamic> json) {
     return Customer(
@@ -200,9 +230,11 @@ class Customer {
           : null,
       subscriptionEndDate: DateTime.parse(json['membership_expiry_date'] ?? DateTime.now().toString()),
       planFee: double.tryParse(json['plan_fee'].toString()) ?? 0.0,
+      plan: json['plan'],
       status: json['status'] ?? 'active',
       createdAt: DateTime.parse(json['created_at'] ?? DateTime.now().toString()),
       assignedStaffId: json['assigned_trainer_id'],
+      displayId: json['display_id'],
     );
   }
 
@@ -263,6 +295,8 @@ class Staff {
   final int assignedCustomersCount;
   final bool isActive;
   final DateTime createdAt;
+  final String trainerRole; // 'staff' | 'admin'
+  final String? displayId;  // e.g. RCV-S-0000001
 
   Staff({
     required this.id,
@@ -272,7 +306,11 @@ class Staff {
     required this.assignedCustomersCount,
     required this.isActive,
     required this.createdAt,
+    this.trainerRole = 'staff',
+    this.displayId,
   });
+
+  bool get isAdmin => trainerRole == 'admin';
 
   factory Staff.fromJson(Map<String, dynamic> json) {
     return Staff(
@@ -285,6 +323,8 @@ class Staff {
       createdAt: json['created_at'] != null
           ? DateTime.parse(json['created_at'])
           : DateTime.now(),
+      trainerRole: json['trainer_role'] ?? 'staff',
+      displayId: json['display_id'],
     );
   }
 }
@@ -515,6 +555,8 @@ class GymProfile {
   final String address;
   final String phone;
   final String email;
+  final bool razorpayConfigured;
+  final String? razorpayKeyHint; // first 8 chars of key ID, e.g. "rzp_test"
 
   GymProfile({
     required this.id,
@@ -522,14 +564,18 @@ class GymProfile {
     required this.address,
     required this.phone,
     required this.email,
+    this.razorpayConfigured = false,
+    this.razorpayKeyHint,
   });
 
   factory GymProfile.fromJson(Map<String, dynamic> json) => GymProfile(
-    id:      json['id']      ?? '',
-    name:    json['name']    ?? '',
-    address: json['address'] ?? '',
-    phone:   json['phone']   ?? '',
-    email:   json['email']   ?? '',
+    id:                  json['id']                   ?? '',
+    name:                json['name']                 ?? '',
+    address:             json['address']              ?? '',
+    phone:               json['phone']                ?? '',
+    email:               json['email']                ?? '',
+    razorpayConfigured:  json['razorpay_configured']  == true,
+    razorpayKeyHint:     json['razorpay_key_hint'],
   );
 }
 
@@ -682,6 +728,206 @@ class AdminBusiness {
   );
 }
 
+// ============================================================================
+// CUSTOMER PORTAL MODELS
+// ============================================================================
+
+class CustomerLoginResponse {
+  final String accessToken;
+  final String memberId;
+  final String gymId;
+  final String gymName;
+  final String name;
+  final bool multiple;
+  final List<Map<String, String>> gyms;
+  final String? firebaseIdToken;
+
+  CustomerLoginResponse({
+    required this.accessToken,
+    required this.memberId,
+    required this.gymId,
+    required this.gymName,
+    required this.name,
+    this.multiple = false,
+    this.gyms = const [],
+    this.firebaseIdToken,
+  });
+
+  factory CustomerLoginResponse.fromJson(Map<String, dynamic> json) {
+    if (json['multiple'] == true) {
+      return CustomerLoginResponse(
+        accessToken: '',
+        memberId: '',
+        gymId: '',
+        gymName: '',
+        name: '',
+        multiple: true,
+        gyms: (json['gyms'] as List? ?? []).map((g) => {
+          'member_id': g['member_id']?.toString() ?? '',
+          'gym_id':    g['gym_id']?.toString()    ?? '',
+          'gym_name':  g['gym_name']?.toString()  ?? '',
+          'name':      g['name']?.toString()      ?? '',
+        }).toList(),
+        firebaseIdToken: json['firebase_id_token']?.toString(),
+      );
+    }
+    final m = json['member'] as Map<String, dynamic>? ?? {};
+    return CustomerLoginResponse(
+      accessToken: json['access_token'] ?? '',
+      memberId:    m['id']       ?? '',
+      gymId:       m['gym_id']   ?? '',
+      gymName:     m['gym_name'] ?? '',
+      name:        m['name']     ?? '',
+    );
+  }
+}
+
+class CustomerProfile {
+  final String id;
+  final String name;
+  final String phone;
+  final String email;
+  final String status;
+  final DateTime? lastVisitDate;
+  final DateTime membershipExpiryDate;
+  final double planFee;
+  final String? plan;
+  final DateTime createdAt;
+  final String gymName;
+  final String gymAddress;
+  final String gymPhone;
+  final bool paymentEnabled;
+  final bool emailVerified;
+  final bool phoneVerified;
+
+  CustomerProfile({
+    required this.id,
+    required this.name,
+    required this.phone,
+    required this.email,
+    required this.status,
+    this.lastVisitDate,
+    required this.membershipExpiryDate,
+    required this.planFee,
+    this.plan,
+    required this.createdAt,
+    required this.gymName,
+    required this.gymAddress,
+    required this.gymPhone,
+    required this.paymentEnabled,
+    this.emailVerified = false,
+    this.phoneVerified = false,
+  });
+
+  String get planDisplay => planLabel(plan);
+
+  factory CustomerProfile.fromJson(Map<String, dynamic> json) => CustomerProfile(
+    id:                   json['id']            ?? '',
+    name:                 json['name']          ?? '',
+    phone:                json['phone']         ?? '',
+    email:                json['email']         ?? '',
+    status:               json['status']        ?? 'active',
+    lastVisitDate:        json['last_visit_date'] != null ? DateTime.tryParse(json['last_visit_date']) : null,
+    membershipExpiryDate: DateTime.tryParse(json['membership_expiry_date'] ?? '') ?? DateTime.now(),
+    planFee:              double.tryParse(json['plan_fee']?.toString() ?? '0') ?? 0,
+    plan:                 json['plan'],
+    createdAt:            DateTime.tryParse(json['created_at'] ?? '') ?? DateTime.now(),
+    gymName:              json['gym_name']    ?? '',
+    gymAddress:           json['gym_address'] ?? '',
+    gymPhone:             json['gym_phone']   ?? '',
+    paymentEnabled:       json['payment_enabled'] == true,
+    emailVerified:        json['email_verified'] == true,
+    phoneVerified:        json['phone_verified'] == true,
+  );
+
+  int get daysUntilExpiry => membershipExpiryDate.difference(DateTime.now()).inDays;
+  int get daysSinceLastVisit => lastVisitDate == null ? 999 : DateTime.now().difference(lastVisitDate!).inDays;
+
+  String get statusDisplay {
+    switch (status) {
+      case 'active':    return 'Active';
+      case 'at_risk':   return 'At Risk';
+      case 'high_risk': return 'High Risk';
+      default:          return 'Active';
+    }
+  }
+}
+
+class Payment {
+  final String id;
+  final int amount; // paise
+  final String currency;
+  final String status;
+  final String? paymentMethod;
+  final String? description;
+  final DateTime createdAt;
+  final String? memberName;
+  final String? memberPhone;
+
+  Payment({
+    required this.id,
+    required this.amount,
+    required this.currency,
+    required this.status,
+    this.paymentMethod,
+    this.description,
+    required this.createdAt,
+    this.memberName,
+    this.memberPhone,
+  });
+
+  factory Payment.fromJson(Map<String, dynamic> json) => Payment(
+    id:            json['id']             ?? '',
+    amount:        int.tryParse(json['amount']?.toString() ?? '0') ?? 0,
+    currency:      json['currency']        ?? 'INR',
+    status:        json['status']          ?? 'pending',
+    paymentMethod: json['payment_method'],
+    description:   json['description'],
+    createdAt:     DateTime.tryParse(json['created_at'] ?? '') ?? DateTime.now(),
+    memberName:    json['member_name'],
+    memberPhone:   json['member_phone'],
+  );
+
+  double get amountRupees => amount / 100;
+}
+
+class PaymentsResponse {
+  final List<Payment> payments;
+  final int total;
+  final int totalAmount; // paise
+
+  PaymentsResponse({required this.payments, required this.total, this.totalAmount = 0});
+
+  factory PaymentsResponse.fromJson(Map<String, dynamic> json) => PaymentsResponse(
+    payments:    (json['payments'] as List? ?? []).map((p) => Payment.fromJson(p)).toList(),
+    total:       int.tryParse(json['total']?.toString() ?? '0') ?? 0,
+    totalAmount: int.tryParse(json['total_amount']?.toString() ?? '0') ?? 0,
+  );
+
+  double get totalAmountRupees => totalAmount / 100;
+}
+
+class CustomerPaymentOrder {
+  final String orderId;
+  final int amount;
+  final String currency;
+  final String keyId;
+
+  CustomerPaymentOrder({
+    required this.orderId,
+    required this.amount,
+    required this.currency,
+    required this.keyId,
+  });
+
+  factory CustomerPaymentOrder.fromJson(Map<String, dynamic> json) => CustomerPaymentOrder(
+    orderId:  json['order_id'] ?? '',
+    amount:   int.tryParse(json['amount']?.toString() ?? '0') ?? 0,
+    currency: json['currency'] ?? 'INR',
+    keyId:    json['key_id']   ?? '',
+  );
+}
+
 class RevenueResponse {
   final List<RevenueRecord> revenue;
   final List<RevenueDetailRecord> revenueRecords;
@@ -704,4 +950,62 @@ class RevenueResponse {
   double get totalRevenue {
     return revenue.fold(0, (sum, r) => sum + r.total);
   }
+}
+
+// ============================================================================
+// INVITE CODE MODELS
+// ============================================================================
+
+class InviteCodeResult {
+  final String code;
+  final String displayId;
+  final String type;           // 'staff' | 'member'
+  final String? trainerRole;   // 'staff' | 'admin'
+  final int expiresInDays;
+  final String? placeholderName;
+
+  InviteCodeResult({
+    required this.code,
+    required this.displayId,
+    required this.type,
+    this.trainerRole,
+    this.expiresInDays = 7,
+    this.placeholderName,
+  });
+
+  factory InviteCodeResult.fromJson(Map<String, dynamic> json) => InviteCodeResult(
+    code:            json['code']             ?? '',
+    displayId:       json['display_id']       ?? '',
+    type:            json['type']             ?? '',
+    trainerRole:     json['trainer_role'],
+    expiresInDays:   json['expires_in_days']  ?? 7,
+    placeholderName: json['placeholder_name'],
+  );
+}
+
+class InviteCodeInfo {
+  final String code;
+  final String type;
+  final String displayId;
+  final String? trainerRole;
+  final String gymName;
+  final String? placeholderName;
+
+  InviteCodeInfo({
+    required this.code,
+    required this.type,
+    required this.displayId,
+    this.trainerRole,
+    required this.gymName,
+    this.placeholderName,
+  });
+
+  factory InviteCodeInfo.fromJson(Map<String, dynamic> json) => InviteCodeInfo(
+    code:            json['code']             ?? '',
+    type:            json['type']             ?? '',
+    displayId:       json['display_id']       ?? '',
+    trainerRole:     json['trainer_role'],
+    gymName:         json['gym_name']         ?? '',
+    placeholderName: json['placeholder_name'],
+  );
 }
