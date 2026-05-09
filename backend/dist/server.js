@@ -1207,22 +1207,33 @@ app.post('/api/auth/login', authLimiter, validate(loginSchema), async (req, res,
                 trainerRole = trainerInfo.rows[0]?.trainer_role || 'staff';
             }
             // For members: look up the member record to include member_id in JWT.
-            // Match by email/phone only — do NOT reference user_id column (may not exist).
+            // Strategy 1: direct user_id match (set during registration or prior login).
+            // Strategy 2: email/phone match against users.phone_or_email.
             let memberId;
             if (user.role === 'member') {
+                // Strategy 1 — user_id direct match
                 try {
-                    const memberInfo = await client.query(`SELECT id FROM members
-             WHERE gym_id = $1 AND is_deleted = false
-               AND (LOWER(email) = LOWER($2)
-                    OR phone = $2
-                    OR RIGHT(phone, 10) = RIGHT($2, 10))
-             LIMIT 1`, [user.gym_id, user.phone_or_email]);
-                    memberId = memberInfo.rows[0]?.id;
-                    if (memberId) {
-                        client.query(`UPDATE members SET user_id = $1 WHERE id = $2 AND user_id IS NULL`, [user.id, memberId]).catch(() => { });
-                    }
+                    const byUserId = await client.query(`SELECT id FROM members WHERE user_id = $1 AND gym_id = $2 AND is_deleted = false LIMIT 1`, [user.id, user.gym_id]);
+                    memberId = byUserId.rows[0]?.id;
                 }
-                catch { /* column missing — member_id stays undefined, fallback used at request time */ }
+                catch { /* user_id column may not exist yet */ }
+                // Strategy 2 — email / phone cross-match
+                if (!memberId) {
+                    try {
+                        const memberInfo = await client.query(`SELECT id FROM members
+               WHERE gym_id = $1 AND is_deleted = false
+                 AND (LOWER(email) = LOWER($2)
+                      OR phone = $2
+                      OR RIGHT(phone, 10) = RIGHT($2, 10))
+               LIMIT 1`, [user.gym_id, user.phone_or_email]);
+                        memberId = memberInfo.rows[0]?.id;
+                    }
+                    catch { /* column issue — member_id stays undefined, fallback used at request time */ }
+                }
+                // Backfill user_id for future direct matches
+                if (memberId) {
+                    client.query(`UPDATE members SET user_id = $1 WHERE id = $2 AND user_id IS NULL`, [user.id, memberId]).catch(() => { });
+                }
             }
             const accessToken = jsonwebtoken_1.default.sign({
                 id: user.id, gym_id: user.gym_id, role: user.role,
@@ -3080,14 +3091,36 @@ app.post('/api/attendance/checkin', authenticate, authorize(['member']), async (
         let memberIdParam = req.user.member_id ?? await resolveMemberId(req.user.id, req.gym_id);
         if (!memberIdParam)
             return res.status(404).json({ success: false, error: 'Member profile not found' });
-        const existing = await pool.query(`SELECT id, source FROM attendance_logs
-       WHERE gym_id = $1 AND member_id = $2 AND DATE(visited_at) = $3`, [req.gym_id, memberIdParam, today]);
+        // Check if already marked today — try visited_at first, fall back to visit_date
+        let existing = { rows: [] };
+        try {
+            existing = await pool.query(`SELECT id, source FROM attendance_logs
+         WHERE gym_id = $1 AND member_id = $2 AND DATE(visited_at) = $3`, [req.gym_id, memberIdParam, today]);
+        }
+        catch (colErr) {
+            if (colErr?.message?.includes('visited_at')) {
+                existing = await pool.query(`SELECT id, source FROM attendance_logs
+           WHERE gym_id = $1 AND member_id = $2 AND visit_date = $3`, [req.gym_id, memberIdParam, today]);
+            }
+            else {
+                throw colErr;
+            }
+        }
         if (existing.rows.length > 0) {
             return res.json({ success: true, data: { message: 'Already marked today', already_marked: true, source: existing.rows[0].source } });
         }
-        await pool.query(`INSERT INTO attendance_logs (gym_id, member_id, visited_at, status, source)
-       VALUES ($1, $2, NOW(), 'present', 'mobile')
-       ON CONFLICT DO NOTHING`, [req.gym_id, memberIdParam]);
+        // Insert attendance — try visited_at column first, fall back to visit_date
+        try {
+            await pool.query(`INSERT INTO attendance_logs (gym_id, member_id, visited_at, visit_date, status, source)
+         VALUES ($1, $2, NOW(), $3::date, 'present', 'mobile')
+         ON CONFLICT ON CONSTRAINT idx_attendance_member_day DO NOTHING`, [req.gym_id, memberIdParam, today]);
+        }
+        catch (insertErr) {
+            // visited_at column missing or constraint name wrong — use legacy columns only
+            await pool.query(`INSERT INTO attendance_logs (gym_id, member_id, visit_date, status, source)
+         VALUES ($1, $2, $3, 'present', 'mobile')
+         ON CONFLICT DO NOTHING`, [req.gym_id, memberIdParam, today]);
+        }
         await pool.query(`UPDATE members SET last_visit_date = $1 WHERE id = $2 AND (last_visit_date IS NULL OR last_visit_date < $1)`, [today, memberIdParam]);
         res.json({ success: true, data: { message: 'Attendance marked!', already_marked: false, source: 'mobile' } });
     }
@@ -3103,7 +3136,8 @@ app.get('/api/customer/profile', authenticate, authorize(['member']), async (req
         let memberIdParam = req.user.member_id ?? await resolveMemberId(req.user.id, req.gym_id);
         if (!memberIdParam)
             return res.status(404).json({ success: false, error: 'Profile not found' });
-        // Try with optional columns; fall back gracefully if they don't exist yet
+        // Try full query first; fall back gracefully when optional columns don't exist yet.
+        // Each catch narrows the column set until we have a working query.
         let result;
         try {
             result = await pool.query(`SELECT m.id, m.name, m.phone, m.email, m.status, m.last_visit_date,
@@ -3111,24 +3145,34 @@ app.get('/api/customer/profile', authenticate, authorize(['member']), async (req
                 COALESCE(m.email_verified, FALSE) AS email_verified,
                 COALESCE(m.phone_verified, FALSE) AS phone_verified,
                 g.name AS gym_name, g.address AS gym_address, g.phone AS gym_phone,
-                (g.razorpay_key_id IS NOT NULL AND g.razorpay_key_id != '') AS payment_enabled
+                (COALESCE(g.razorpay_key_id, '') != '') AS payment_enabled
          FROM members m
          JOIN gyms g ON m.gym_id = g.id
          WHERE m.id = $1 AND m.gym_id = $2 AND m.is_deleted = false`, [memberIdParam, req.gym_id]);
         }
         catch (colErr) {
-            if (colErr?.message?.includes('email_verified') || colErr?.message?.includes('phone_verified')) {
+            // Fallback 1: email_verified / phone_verified / plan columns missing
+            try {
                 result = await pool.query(`SELECT m.id, m.name, m.phone, m.email, m.status, m.last_visit_date,
                   m.membership_expiry_date, m.plan_fee, m.plan, m.created_at,
                   FALSE AS email_verified, FALSE AS phone_verified,
                   g.name AS gym_name, g.address AS gym_address, g.phone AS gym_phone,
-                  (g.razorpay_key_id IS NOT NULL AND g.razorpay_key_id != '') AS payment_enabled
+                  FALSE AS payment_enabled
            FROM members m
            JOIN gyms g ON m.gym_id = g.id
            WHERE m.id = $1 AND m.gym_id = $2 AND m.is_deleted = false`, [memberIdParam, req.gym_id]);
             }
-            else {
-                throw colErr;
+            catch (colErr2) {
+                // Fallback 2: plan column also missing — absolute minimum columns
+                result = await pool.query(`SELECT m.id, m.name, m.phone, m.email, m.status, m.last_visit_date,
+                  m.membership_expiry_date, m.plan_fee, m.created_at,
+                  NULL AS plan,
+                  FALSE AS email_verified, FALSE AS phone_verified,
+                  g.name AS gym_name, g.address AS gym_address, g.phone AS gym_phone,
+                  FALSE AS payment_enabled
+           FROM members m
+           JOIN gyms g ON m.gym_id = g.id
+           WHERE m.id = $1 AND m.gym_id = $2 AND m.is_deleted = false`, [memberIdParam, req.gym_id]);
             }
         }
         if (result.rows.length === 0)
@@ -3195,9 +3239,19 @@ app.get('/api/customer/attendance', authenticate, authorize(['member']), async (
 // ============================================================================
 // PAYMENT ENDPOINTS
 // ============================================================================
-// Resolve member_id by matching email/phone through users table.
-// Does NOT reference members.user_id so it works even if that column is missing.
+// Resolve member_id for a logged-in member user.
+// Strategy 1: direct user_id match (fastest, works if user_id column exists).
+// Strategy 2: email/phone cross-match via users table (fallback for older members).
+// Silently returns undefined on any error so callers can return a friendly 404.
 async function resolveMemberId(userId, gymId) {
+    // Strategy 1 — direct user_id link (populated by registration or prior login)
+    try {
+        const direct = await pool.query(`SELECT id FROM members WHERE user_id = $1 AND gym_id = $2 AND is_deleted = false LIMIT 1`, [userId, gymId]);
+        if (direct.rows[0]?.id)
+            return direct.rows[0].id;
+    }
+    catch { /* user_id column may not exist yet — fall through to strategy 2 */ }
+    // Strategy 2 — match via email or phone stored in users.phone_or_email
     try {
         const lookup = await pool.query(`SELECT m.id FROM members m
        JOIN users u ON u.id = $1
@@ -3207,7 +3261,7 @@ async function resolveMemberId(userId, gymId) {
               OR RIGHT(m.phone, 10) = RIGHT(u.phone_or_email, 10))
        LIMIT 1`, [userId, gymId]);
         const memberId = lookup.rows[0]?.id;
-        // Best-effort: link user_id so future logins embed member_id in JWT
+        // Best-effort: backfill user_id so future requests hit strategy 1
         if (memberId) {
             pool.query(`UPDATE members SET user_id = $1 WHERE id = $2 AND user_id IS NULL`, [userId, memberId]).catch(() => { });
         }
