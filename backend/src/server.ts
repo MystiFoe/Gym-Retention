@@ -1401,26 +1401,28 @@ app.post('/api/auth/login', authLimiter, validate(loginSchema), async (req: Auth
         trainerRole = trainerInfo.rows[0]?.trainer_role || 'staff';
       }
 
-      // For members: look up the member record to include member_id in the JWT
+      // For members: look up the member record to include member_id in JWT.
+      // Match by email/phone only — do NOT reference user_id column (may not exist).
       let memberId: string | undefined;
       if (user.role === 'member') {
-        const memberInfo = await client.query(
-          `SELECT id FROM members
-           WHERE gym_id = $1 AND is_deleted = false
-             AND (user_id = $2
-                  OR LOWER(email) = LOWER($3)
-                  OR phone = $3
-                  OR RIGHT(phone, 10) = RIGHT($3, 10))
-           LIMIT 1`,
-          [user.gym_id, user.id, user.phone_or_email]
-        );
-        memberId = memberInfo.rows[0]?.id;
-        if (memberId) {
-          client.query(
-            `UPDATE members SET user_id = $1 WHERE id = $2 AND user_id IS NULL`,
-            [user.id, memberId]
-          ).catch(() => {});
-        }
+        try {
+          const memberInfo = await client.query(
+            `SELECT id FROM members
+             WHERE gym_id = $1 AND is_deleted = false
+               AND (LOWER(email) = LOWER($2)
+                    OR phone = $2
+                    OR RIGHT(phone, 10) = RIGHT($2, 10))
+             LIMIT 1`,
+            [user.gym_id, user.phone_or_email]
+          );
+          memberId = memberInfo.rows[0]?.id;
+          if (memberId) {
+            client.query(
+              `UPDATE members SET user_id = $1 WHERE id = $2 AND user_id IS NULL`,
+              [user.id, memberId]
+            ).catch(() => {});
+          }
+        } catch { /* column missing — member_id stays undefined, fallback used at request time */ }
       }
 
       const accessToken = jwt.sign(
@@ -3778,18 +3780,36 @@ app.get('/api/customer/profile', authenticate, authorize(['member']), async (req
     let memberIdParam = req.user.member_id ?? await resolveMemberId(req.user.id, req.gym_id!);
     if (!memberIdParam) return res.status(404).json({ success: false, error: 'Profile not found' });
 
-    const result = await pool.query(
-      `SELECT m.id, m.name, m.phone, m.email, m.status, m.last_visit_date,
-              m.membership_expiry_date, m.plan_fee, m.plan, m.created_at,
-              COALESCE(m.email_verified, FALSE) AS email_verified,
-              COALESCE(m.phone_verified, FALSE) AS phone_verified,
-              g.name AS gym_name, g.address AS gym_address, g.phone AS gym_phone,
-              (g.razorpay_key_id IS NOT NULL AND g.razorpay_key_id != '') AS payment_enabled
-       FROM members m
-       JOIN gyms g ON m.gym_id = g.id
-       WHERE m.id = $1 AND m.gym_id = $2 AND m.is_deleted = false`,
-      [memberIdParam, req.gym_id]
-    );
+    // Try with optional columns; fall back gracefully if they don't exist yet
+    let result: any;
+    try {
+      result = await pool.query(
+        `SELECT m.id, m.name, m.phone, m.email, m.status, m.last_visit_date,
+                m.membership_expiry_date, m.plan_fee, m.plan, m.created_at,
+                COALESCE(m.email_verified, FALSE) AS email_verified,
+                COALESCE(m.phone_verified, FALSE) AS phone_verified,
+                g.name AS gym_name, g.address AS gym_address, g.phone AS gym_phone,
+                (g.razorpay_key_id IS NOT NULL AND g.razorpay_key_id != '') AS payment_enabled
+         FROM members m
+         JOIN gyms g ON m.gym_id = g.id
+         WHERE m.id = $1 AND m.gym_id = $2 AND m.is_deleted = false`,
+        [memberIdParam, req.gym_id]
+      );
+    } catch (colErr: any) {
+      if (colErr?.message?.includes('email_verified') || colErr?.message?.includes('phone_verified')) {
+        result = await pool.query(
+          `SELECT m.id, m.name, m.phone, m.email, m.status, m.last_visit_date,
+                  m.membership_expiry_date, m.plan_fee, m.plan, m.created_at,
+                  FALSE AS email_verified, FALSE AS phone_verified,
+                  g.name AS gym_name, g.address AS gym_address, g.phone AS gym_phone,
+                  (g.razorpay_key_id IS NOT NULL AND g.razorpay_key_id != '') AS payment_enabled
+           FROM members m
+           JOIN gyms g ON m.gym_id = g.id
+           WHERE m.id = $1 AND m.gym_id = $2 AND m.is_deleted = false`,
+          [memberIdParam, req.gym_id]
+        );
+      } else { throw colErr; }
+    }
     if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Profile not found' });
     res.json({ success: true, data: result.rows[0] });
   } catch (error) { next(error); }
@@ -3815,17 +3835,34 @@ app.get('/api/customer/attendance', authenticate, authorize(['member']), async (
     const month = parseInt((req.query.month as string) || `${new Date().getMonth() + 1}`);
     let memberIdParam = req.user.member_id ?? await resolveMemberId(req.user.id, req.gym_id!);
     if (!memberIdParam) return res.json({ success: true, data: [] });
-    const result = await pool.query(
-      `SELECT DATE(visited_at)::text AS date, status, COALESCE(source, 'staff') AS source
-       FROM attendance_logs
-       WHERE member_id = $1 AND gym_id = $2
-         AND visited_at IS NOT NULL
-         AND EXTRACT(YEAR  FROM visited_at) = $3
-         AND EXTRACT(MONTH FROM visited_at) = $4
-       ORDER BY date`,
-      [memberIdParam, req.gym_id, year, month]
-    );
-    res.json({ success: true, data: result.rows });
+    let attResult: any;
+    try {
+      attResult = await pool.query(
+        `SELECT DATE(visited_at)::text AS date, status, COALESCE(source, 'staff') AS source
+         FROM attendance_logs
+         WHERE member_id = $1 AND gym_id = $2
+           AND visited_at IS NOT NULL
+           AND EXTRACT(YEAR  FROM visited_at) = $3
+           AND EXTRACT(MONTH FROM visited_at) = $4
+         ORDER BY date`,
+        [memberIdParam, req.gym_id, year, month]
+      );
+    } catch (colErr: any) {
+      // visited_at column missing — fall back to visit_date
+      if (colErr?.message?.includes('visited_at')) {
+        attResult = await pool.query(
+          `SELECT visit_date::text AS date, status, COALESCE(source, 'staff') AS source
+           FROM attendance_logs
+           WHERE member_id = $1 AND gym_id = $2
+             AND visit_date IS NOT NULL
+             AND EXTRACT(YEAR  FROM visit_date) = $3
+             AND EXTRACT(MONTH FROM visit_date) = $4
+           ORDER BY date`,
+          [memberIdParam, req.gym_id, year, month]
+        );
+      } else { throw colErr; }
+    }
+    res.json({ success: true, data: attResult.rows });
   } catch (error) { next(error); }
 });
 
@@ -3833,22 +3870,22 @@ app.get('/api/customer/attendance', authenticate, authorize(['member']), async (
 // PAYMENT ENDPOINTS
 // ============================================================================
 
-// Resolve member_id from JWT user — JOIN through users table so email/phone match works
-// even when members.user_id is NULL (manually-added members). Also auto-links user_id.
+// Resolve member_id by matching email/phone through users table.
+// Does NOT reference members.user_id so it works even if that column is missing.
 async function resolveMemberId(userId: string, gymId: string): Promise<string | undefined> {
   try {
     const lookup = await pool.query(
       `SELECT m.id FROM members m
        JOIN users u ON u.id = $1
        WHERE m.gym_id = $2 AND m.is_deleted = false
-         AND (m.user_id = u.id
-              OR LOWER(m.email) = LOWER(u.phone_or_email)
+         AND (LOWER(m.email) = LOWER(u.phone_or_email)
               OR m.phone = u.phone_or_email
               OR RIGHT(m.phone, 10) = RIGHT(u.phone_or_email, 10))
        LIMIT 1`,
       [userId, gymId]
     );
     const memberId = lookup.rows[0]?.id;
+    // Best-effort: link user_id so future logins embed member_id in JWT
     if (memberId) {
       pool.query(
         `UPDATE members SET user_id = $1 WHERE id = $2 AND user_id IS NULL`,
