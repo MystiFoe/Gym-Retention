@@ -254,7 +254,7 @@ pool.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS visited_at TIME
   pool.query(`UPDATE attendance_logs SET visited_at = (visit_date::date + COALESCE(check_in_time, '00:00:00')::time)::timestamptz WHERE visited_at IS NULL AND visit_date IS NOT NULL`)
 ).catch(() => {});
 // Prevent duplicate attendance for same member on same day (partial index — only when visited_at is set)
-pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_member_day ON attendance_logs(gym_id, member_id, DATE(visited_at)) WHERE visited_at IS NOT NULL`).catch(() => {});
+pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_member_day ON attendance_logs(gym_id, member_id, visit_date) WHERE visit_date IS NOT NULL`).catch(() => {});
 // Link members to their user account (for password-login members)
 pool.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE SET NULL`).catch(() => {});
 pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_members_user_id ON members(user_id) WHERE user_id IS NOT NULL`).catch(() => {});
