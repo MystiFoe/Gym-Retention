@@ -1528,8 +1528,20 @@ app.post('/api/auth/refresh', async (req: Request, res: Response, next: NextFunc
       refreshTrainerRole = trainerInfo.rows[0]?.trainer_role || 'staff';
     }
 
+    // Re-resolve member_id for member users — refresh tokens don't store it,
+    // so without this the refreshed token loses member_id and all customer
+    // endpoints fall back to resolveMemberId() on every request.
+    let refreshMemberId: string | undefined;
+    if (user.role === 'member') {
+      refreshMemberId = await resolveMemberId(user.id, user.gym_id);
+    }
+
     const newAccessToken  = jwt.sign(
-      { id: user.id, gym_id: user.gym_id, role: user.role, ...(refreshTrainerRole ? { trainer_role: refreshTrainerRole } : {}) },
+      {
+        id: user.id, gym_id: user.gym_id, role: user.role,
+        ...(refreshTrainerRole ? { trainer_role: refreshTrainerRole } : {}),
+        ...(refreshMemberId    ? { member_id: refreshMemberId }         : {}),
+      },
       process.env.JWT_SECRET!,
       { expiresIn: '1h' }
     );
@@ -5033,14 +5045,71 @@ app.post('/api/auth/member/register', async (req: Request, res: Response, next: 
       );
       const user = userRes.rows[0];
 
-      // Link user to existing member record, fill in details, set verification flags
-      if (invite.member_id) {
-        await client.query(
-          `UPDATE members SET name = $1, phone = $2, email = $3, user_id = $4,
-                              email_verified = $5, phone_verified = $6
-           WHERE id = $7`,
-          [name, phone, email, user.id, emailVerified, phoneVerified, invite.member_id]
-        );
+      // Link user to a member record.
+      // Case A: invite was created for a specific member (most common).
+      // Case B: generic invite — find existing member by phone/email or create one.
+      let linkedMemberId: string | null = invite.member_id || null;
+
+      if (!linkedMemberId) {
+        // Try to find an existing unlinked member in this gym matching by phone or email
+        try {
+          const existing = await client.query(
+            `SELECT id FROM members
+             WHERE gym_id = $1 AND is_deleted = false
+               AND (LOWER(email) = LOWER($2) OR phone = $3 OR RIGHT(phone, 10) = RIGHT($3, 10))
+             LIMIT 1`,
+            [invite.gym_id, email, phone]
+          );
+          linkedMemberId = existing.rows[0]?.id || null;
+        } catch { /* ignore — will create new record below */ }
+
+        if (!linkedMemberId) {
+          // No existing member found — create a new placeholder record
+          try {
+            const newMember = await client.query(
+              `INSERT INTO members (gym_id, name, phone, email, user_id, membership_expiry_date, plan_fee, plan, status)
+               VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '30 days', 0, 'monthly', 'active') RETURNING id`,
+              [invite.gym_id, name, phone, email, user.id]
+            );
+            linkedMemberId = newMember.rows[0]?.id || null;
+          } catch {
+            // If user_id column doesn't exist yet, insert without it
+            try {
+              const newMember = await client.query(
+                `INSERT INTO members (gym_id, name, phone, email, membership_expiry_date, plan_fee, plan, status)
+                 VALUES ($1, $2, $3, $4, NOW() + INTERVAL '30 days', 0, 'monthly', 'active') RETURNING id`,
+                [invite.gym_id, name, phone, email]
+              );
+              linkedMemberId = newMember.rows[0]?.id || null;
+            } catch { /* give up */ }
+          }
+        }
+      }
+
+      // Update the linked member record with the new user details
+      if (linkedMemberId) {
+        try {
+          await client.query(
+            `UPDATE members SET name = $1, phone = $2, email = $3, user_id = $4,
+                                email_verified = $5, phone_verified = $6
+             WHERE id = $7`,
+            [name, phone, email, user.id, emailVerified, phoneVerified, linkedMemberId]
+          );
+        } catch {
+          // email_verified/phone_verified columns may not exist yet
+          try {
+            await client.query(
+              `UPDATE members SET name = $1, phone = $2, email = $3, user_id = $4 WHERE id = $5`,
+              [name, phone, email, user.id, linkedMemberId]
+            );
+          } catch {
+            // user_id column may not exist — update only name/phone/email
+            await client.query(
+              `UPDATE members SET name = $1, phone = $2, email = $3 WHERE id = $4`,
+              [name, phone, email, linkedMemberId]
+            );
+          }
+        }
       }
 
       // Mark invite used
@@ -5049,7 +5118,7 @@ app.post('/api/auth/member/register', async (req: Request, res: Response, next: 
       await client.query('COMMIT');
 
       const accessToken = jwt.sign(
-        { id: user.id, gym_id: user.gym_id, role: 'member', member_id: invite.member_id || null },
+        { id: user.id, gym_id: user.gym_id, role: 'member', member_id: linkedMemberId },
         process.env.JWT_SECRET!,
         { expiresIn: '1h' }
       );
@@ -5064,7 +5133,7 @@ app.post('/api/auth/member/register', async (req: Request, res: Response, next: 
         data: {
           accessToken,
           refreshToken,
-          user: { id: user.id, gym_id: user.gym_id, role: 'member', member_id: invite.member_id || null },
+          user: { id: user.id, gym_id: user.gym_id, role: 'member', member_id: linkedMemberId },
         }
       });
     } catch (error) {
