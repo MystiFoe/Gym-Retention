@@ -3213,7 +3213,7 @@ app.get('/api/customer/attendance', authenticate, authorize(['member']), async (
         const month = parseInt(req.query.month || `${new Date().getMonth() + 1}`);
         let memberIdParam = req.user.member_id ?? await resolveMemberId(req.user.id, req.gym_id);
         if (!memberIdParam)
-            return res.json({ success: true, data: [] });
+            return res.status(404).json({ success: false, error: 'Member profile not found. Please contact your gym.' });
         let attResult;
         try {
             attResult = await pool.query(`SELECT DATE(visited_at)::text AS date, status, COALESCE(source, 'staff') AS source
@@ -3267,7 +3267,9 @@ async function resolveMemberId(userId, gymId) {
        WHERE m.gym_id = $2 AND m.is_deleted = false
          AND (LOWER(m.email) = LOWER(u.phone_or_email)
               OR m.phone = u.phone_or_email
-              OR RIGHT(m.phone, 10) = RIGHT(u.phone_or_email, 10))
+              OR RIGHT(m.phone, 10) = RIGHT(u.phone_or_email, 10)
+              OR (u.phone IS NOT NULL AND (m.phone = u.phone OR RIGHT(m.phone, 10) = RIGHT(u.phone, 10)))
+              OR (u.phone IS NOT NULL AND LOWER(m.email) = LOWER(u.phone)))
        LIMIT 1`, [userId, gymId]);
         const memberId = lookup.rows[0]?.id;
         // Best-effort: backfill user_id so future requests hit strategy 1
@@ -3285,7 +3287,7 @@ async function razorpayRequest(gymId, path, method, body) {
     const gym = gymRes.rows[0];
     if (!gym?.razorpay_key_id || !gym?.razorpay_key_secret) {
         const err = new Error('Online payments not set up for this gym yet. Contact your gym owner.');
-        err.statusCode = 400;
+        err.status = 400;
         throw err;
     }
     const auth = Buffer.from(`${gym.razorpay_key_id}:${gym.razorpay_key_secret}`).toString('base64');
@@ -3297,7 +3299,7 @@ async function razorpayRequest(gymId, path, method, body) {
     const data = await response.json();
     if (data.error) {
         const err = new Error(data.error.description || 'Payment gateway error');
-        err.statusCode = 502;
+        err.status = 502;
         throw err;
     }
     return { data, keyId: gym.razorpay_key_id };

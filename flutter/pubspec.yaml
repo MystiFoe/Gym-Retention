@@ -46,6 +46,8 @@ dependencies:
   firebase_core: ^3.3.0
   firebase_auth: ^5.1.0
   firebase_messaging: ^15.0.0
+  # QR code display — member attendance QR on profile tab
+  qr_flutter: ^4.1.0
   # Bulk import — file picking, Excel, CSV parsing
   file_picker: ^8.0.0
   excel: ^4.0.0

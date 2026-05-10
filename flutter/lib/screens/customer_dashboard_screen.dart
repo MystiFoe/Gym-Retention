@@ -87,6 +87,7 @@ class _AttendanceTabState extends State<_AttendanceTab> {
   bool _marking = false;
   bool? _markedToday; // null=unknown, true=marked, false=not marked
   String? _todaySource;
+  String? _error;
 
   @override
   void initState() {
@@ -96,12 +97,12 @@ class _AttendanceTabState extends State<_AttendanceTab> {
   }
 
   Future<void> _load() async {
-    setState(() => _loading = true);
+    setState(() { _loading = true; _error = null; });
     try {
       final data = await ApiService().getMyAttendance(year: _month.year, month: _month.month);
       if (mounted) setState(() { _records = data; _loading = false; });
-    } catch (_) {
-      if (mounted) setState(() => _loading = false);
+    } catch (e) {
+      if (mounted) setState(() { _loading = false; _error = e.toString().replaceFirst('Exception: ', ''); });
     }
   }
 
@@ -212,6 +213,17 @@ class _AttendanceTabState extends State<_AttendanceTab> {
               // ── Calendar ─────────────────────────────────────────────
               if (_loading)
                 const Expanded(child: Center(child: CircularProgressIndicator()))
+              else if (_error != null)
+                Expanded(child: Center(child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    const Icon(Icons.error_outline, size: 48, color: Colors.orange),
+                    const SizedBox(height: 12),
+                    Text(_error!, textAlign: TextAlign.center),
+                    const SizedBox(height: 12),
+                    TextButton(onPressed: _load, child: const Text('Retry')),
+                  ]),
+                )))
               else
                 Expanded(child: _CalendarGrid(month: _month, records: _records)),
 
@@ -668,6 +680,7 @@ class _ProfileTabState extends State<_ProfileTab> {
   bool _loading = true;
   bool _editing = false;
   bool _saving  = false;
+  String? _error;
   final _nameCtrl  = TextEditingController();
   final _emailCtrl = TextEditingController();
 
@@ -685,12 +698,12 @@ class _ProfileTabState extends State<_ProfileTab> {
   }
 
   Future<void> _load() async {
-    setState(() { _loading = true; });
+    setState(() { _loading = true; _error = null; });
     try {
       final p = await ApiService().getCustomerProfile();
       if (mounted) setState(() { _profile = p; _nameCtrl.text = p.name; _emailCtrl.text = p.email; _loading = false; });
-    } catch (_) {
-      if (mounted) setState(() => _loading = false);
+    } catch (e) {
+      if (mounted) setState(() { _loading = false; _error = e.toString().replaceFirst('Exception: ', ''); });
     }
   }
 
@@ -730,7 +743,27 @@ class _ProfileTabState extends State<_ProfileTab> {
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
-          : SingleChildScrollView(
+          : _error != null && _profile == null
+              ? Center(child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.error_outline, size: 56, color: Colors.red),
+                      const SizedBox(height: 16),
+                      Text(_error!, textAlign: TextAlign.center, style: const TextStyle(fontSize: 14)),
+                      const SizedBox(height: 20),
+                      ElevatedButton(onPressed: _load, child: const Text('Retry')),
+                      const SizedBox(height: 8),
+                      TextButton.icon(
+                        icon: const Icon(Icons.logout, color: Colors.red),
+                        label: const Text('Logout', style: TextStyle(color: Colors.red)),
+                        onPressed: () async { await ApiService().logout(); if (context.mounted) context.go('/login'); },
+                      ),
+                    ],
+                  ),
+                ))
+              : SingleChildScrollView(
               padding: const EdgeInsets.all(16),
               child: Column(
                 children: [
