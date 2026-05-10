@@ -372,6 +372,16 @@ class ApiService {
     await _handleResponse(response, (data) => data);
   }
 
+  Future<void> linkMemberAccount({required String phone}) async {
+    await loadTokens();
+    final response = await http.post(
+      Uri.parse('$baseUrl/customer/link-account'),
+      headers: _getHeaders(),
+      body: jsonEncode({'phone': phone}),
+    );
+    await _handleResponse(response, (data) => data);
+  }
+
   Future<List<Map<String, dynamic>>> getMyAttendance({required int year, required int month}) async {
     await loadTokens();
     final uri = Uri.parse('$baseUrl/customer/attendance').replace(queryParameters: {
@@ -829,7 +839,7 @@ class ApiService {
     String? lastVisitDate,
     required String subscriptionEndDate,
     required double planFee,
-    required String plan,
+    String plan = 'monthly',
     String? assignedStaffId,
   }) async {
     final response = await http.post(
@@ -856,7 +866,7 @@ class ApiService {
     required String email,
     required String subscriptionEndDate,
     required double planFee,
-    required String plan,
+    String plan = 'monthly',
     required String staffId,
   }) async {
     final response = await http.put(

@@ -680,6 +680,7 @@ class _ProfileTabState extends State<_ProfileTab> {
   bool _loading = true;
   bool _editing = false;
   bool _saving  = false;
+  bool _linking = false;
   String? _error;
   final _nameCtrl  = TextEditingController();
   final _emailCtrl = TextEditingController();
@@ -704,6 +705,64 @@ class _ProfileTabState extends State<_ProfileTab> {
       if (mounted) setState(() { _profile = p; _nameCtrl.text = p.name; _emailCtrl.text = p.email; _loading = false; });
     } catch (e) {
       if (mounted) setState(() { _loading = false; _error = e.toString().replaceFirst('Exception: ', ''); });
+    }
+  }
+
+  Future<void> _showLinkAccountDialog() async {
+    final phoneCtrl = TextEditingController();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Link Your Account'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Enter the phone number your gym owner used when adding you as a member.',
+              style: TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: phoneCtrl,
+              keyboardType: TextInputType.phone,
+              autofocus: true,
+              decoration: InputDecoration(
+                labelText: 'Registered Phone Number',
+                prefixIcon: const Icon(Icons.phone),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2196F3), foregroundColor: Colors.white),
+            child: const Text('Link'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+    final phone = phoneCtrl.text.trim();
+    if (phone.isEmpty) return;
+
+    setState(() { _linking = true; _error = null; });
+    try {
+      await ApiService().linkMemberAccount(phone: phone);
+      if (mounted) {
+        AppUiHelper().showModernSnackBar(context, message: 'Account linked! Loading your profile...');
+        _load();
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() { _linking = false; _error = e.toString().replaceFirst('Exception: ', ''); });
+        AppUiHelper().showModernSnackBar(context, message: _error!, isError: true);
+      }
     }
   }
 
@@ -754,6 +813,24 @@ class _ProfileTabState extends State<_ProfileTab> {
                       Text(_error!, textAlign: TextAlign.center, style: const TextStyle(fontSize: 14)),
                       const SizedBox(height: 20),
                       ElevatedButton(onPressed: _load, child: const Text('Retry')),
+                      const SizedBox(height: 8),
+                      ElevatedButton.icon(
+                        icon: _linking
+                            ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                            : const Icon(Icons.link),
+                        label: const Text('Link Account'),
+                        onPressed: _linking ? null : _showLinkAccountDialog,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.orange,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Use this if your gym added you manually',
+                        style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                      ),
                       const SizedBox(height: 8),
                       TextButton.icon(
                         icon: const Icon(Icons.logout, color: Colors.red),

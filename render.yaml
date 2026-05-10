@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: recurva-api
+    runtime: node
+    region: singapore  # closest free region to India
+    rootDir: backend
+    buildCommand: npm install && npm run build
+    startCommand: node dist/server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        value: postgresql://postgres.usnmhjdflmuvrugdokfu:Recurva%40%242026@aws-1-ap-northeast-1.pooler.supabase.com:6543/postgres
+      - key: JWT_SECRET
+        value: b70c4ceea374df4fbe11f72d0b37e5427b86f49070a98077ae4502d39c35af69
+      - key: JWT_REFRESH_SECRET
+        value: ffec29396540eb4b60e355e44e99ae507ff0adb3ae0ccf5e1c3cbd70e678ea1a
+      - key: ADMIN_SECRET
+        value: GymAdmin@Secret123456789012345678
+      - key: CORS_ORIGIN
+        value: "https://recurva-app.web.app"
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_SECURE
+        value: "false"
+      - key: SMTP_FROM
+        value: noreply@recurva.app
+      - key: LOG_LEVEL
+        value: info

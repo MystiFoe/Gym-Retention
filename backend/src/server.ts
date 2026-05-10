@@ -3834,6 +3834,73 @@ app.post('/api/attendance/checkin', authenticate, authorize(['member']), async (
 });
 
 // ============================================================================
+// CUSTOMER LINK-ACCOUNT  (self-service repair for broken member links)
+// ============================================================================
+
+app.post('/api/customer/link-account', authenticate, authorize(['member']), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { phone } = req.body;
+    if (!phone || String(phone).trim().length < 5) {
+      return res.status(400).json({ success: false, error: 'Phone number is required' });
+    }
+    const normalizedPhone = String(phone).trim();
+
+    // Find member record in the same gym by phone number
+    const memberResult = await pool.query(
+      `SELECT id, name FROM members
+       WHERE gym_id = $1 AND is_deleted = false
+         AND (phone = $2 OR RIGHT(phone, 10) = RIGHT($2, 10))
+       LIMIT 1`,
+      [req.gym_id, normalizedPhone]
+    );
+
+    if (memberResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'No member found with that phone number in your gym. Please check with your gym owner.'
+      });
+    }
+
+    const member = memberResult.rows[0];
+
+    // Check if this member record is already linked to a DIFFERENT user
+    let existingUserResult: any;
+    try {
+      existingUserResult = await pool.query(
+        `SELECT user_id FROM members WHERE id = $1`,
+        [member.id]
+      );
+      const existingUserId = existingUserResult.rows[0]?.user_id;
+      if (existingUserId && existingUserId !== req.user.id) {
+        return res.status(409).json({
+          success: false,
+          error: 'This member record is already linked to another account. Please contact your gym owner.'
+        });
+      }
+    } catch (_) { /* user_id column may not exist yet, skip check */ }
+
+    // Link: set user_id and email on the member record
+    const userResult = await pool.query(`SELECT phone_or_email FROM users WHERE id = $1`, [req.user.id]);
+    const userEmail = userResult.rows[0]?.phone_or_email || null;
+
+    try {
+      await pool.query(
+        `UPDATE members SET user_id = $1, email = COALESCE(NULLIF(TRIM(email), ''), $2) WHERE id = $3`,
+        [req.user.id, userEmail, member.id]
+      );
+    } catch (_) {
+      // user_id column missing — update email only
+      await pool.query(
+        `UPDATE members SET email = COALESCE(NULLIF(TRIM(email), ''), $1) WHERE id = $2`,
+        [userEmail, member.id]
+      );
+    }
+
+    res.json({ success: true, data: { message: `Account linked to member "${member.name}" successfully!`, member_id: member.id } });
+  } catch (error) { next(error); }
+});
+
+// ============================================================================
 // CUSTOMER PORTAL ENDPOINTS  (role: member)
 // ============================================================================
 
