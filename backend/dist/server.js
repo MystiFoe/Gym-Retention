@@ -3149,6 +3149,69 @@ app.post('/api/attendance/checkin', authenticate, authorize(['member']), async (
     }
 });
 // ============================================================================
+// CUSTOMER LINK-ACCOUNT  (self-service repair for broken member links)
+// ============================================================================
+app.post('/api/customer/link-account', authenticate, authorize(['member']), async (req, res, next) => {
+    try {
+        const { phone } = req.body;
+        if (!phone || String(phone).trim().length < 5) {
+            return res.status(400).json({ success: false, error: 'Phone number is required' });
+        }
+        const normalizedPhone = String(phone).trim();
+        // Find member record in the same gym by phone number
+        const memberResult = await pool.query(`SELECT id, name FROM members
+       WHERE gym_id = $1 AND is_deleted = false
+         AND (phone = $2 OR RIGHT(phone, 10) = RIGHT($2, 10))
+       LIMIT 1`, [req.gym_id, normalizedPhone]);
+        if (memberResult.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'No member found with that phone number in your gym. Please check with your gym owner.'
+            });
+        }
+        const member = memberResult.rows[0];
+        // Check if this member record is already linked to a DIFFERENT user
+        let existingUserResult;
+        try {
+            existingUserResult = await pool.query(`SELECT user_id FROM members WHERE id = $1`, [member.id]);
+            const existingUserId = existingUserResult.rows[0]?.user_id;
+            if (existingUserId && existingUserId !== req.user.id) {
+                return res.status(409).json({
+                    success: false,
+                    error: 'This member record is already linked to another account. Please contact your gym owner.'
+                });
+            }
+        }
+        catch (_) { /* user_id column may not exist yet, skip check */ }
+        // Link: set user_id and email on the real member record
+        const userResult = await pool.query(`SELECT phone_or_email FROM users WHERE id = $1`, [req.user.id]);
+        const userEmail = userResult.rows[0]?.phone_or_email || null;
+        try {
+            await pool.query(`UPDATE members SET user_id = $1, email = COALESCE(NULLIF(TRIM(email), ''), $2) WHERE id = $3`, [req.user.id, userEmail, member.id]);
+        }
+        catch (_) {
+            await pool.query(`UPDATE members SET email = COALESCE(NULLIF(TRIM(email), ''), $1) WHERE id = $2`, [userEmail, member.id]);
+        }
+        // Soft-delete any stale placeholder member previously linked to this user (different id)
+        if (req.user.member_id && req.user.member_id !== member.id) {
+            try {
+                await pool.query(`UPDATE members SET is_deleted = true WHERE id = $1 AND gym_id = $2 AND (phone IS NULL OR phone = '') AND (name IS NULL OR name = '')`, [req.user.member_id, req.gym_id]);
+            }
+            catch (_) { /* best effort */ }
+        }
+        // Issue a new access token with the correct member_id so the client doesn't need to re-login
+        const newAccessToken = jsonwebtoken_1.default.sign({ id: req.user.id, gym_id: req.gym_id, role: 'member', member_id: member.id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+        res.json({ success: true, data: {
+                message: `Account linked to member "${member.name}" successfully!`,
+                member_id: member.id,
+                access_token: newAccessToken,
+            } });
+    }
+    catch (error) {
+        next(error);
+    }
+});
+// ============================================================================
 // CUSTOMER PORTAL ENDPOINTS  (role: member)
 // ============================================================================
 app.get('/api/customer/profile', authenticate, authorize(['member']), async (req, res, next) => {

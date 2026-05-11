@@ -3879,7 +3879,7 @@ app.post('/api/customer/link-account', authenticate, authorize(['member']), asyn
       }
     } catch (_) { /* user_id column may not exist yet, skip check */ }
 
-    // Link: set user_id and email on the member record
+    // Link: set user_id and email on the real member record
     const userResult = await pool.query(`SELECT phone_or_email FROM users WHERE id = $1`, [req.user.id]);
     const userEmail = userResult.rows[0]?.phone_or_email || null;
 
@@ -3889,14 +3889,34 @@ app.post('/api/customer/link-account', authenticate, authorize(['member']), asyn
         [req.user.id, userEmail, member.id]
       );
     } catch (_) {
-      // user_id column missing — update email only
       await pool.query(
         `UPDATE members SET email = COALESCE(NULLIF(TRIM(email), ''), $1) WHERE id = $2`,
         [userEmail, member.id]
       );
     }
 
-    res.json({ success: true, data: { message: `Account linked to member "${member.name}" successfully!`, member_id: member.id } });
+    // Soft-delete any stale placeholder member previously linked to this user (different id)
+    if (req.user.member_id && req.user.member_id !== member.id) {
+      try {
+        await pool.query(
+          `UPDATE members SET is_deleted = true WHERE id = $1 AND gym_id = $2 AND (phone IS NULL OR phone = '') AND (name IS NULL OR name = '')`,
+          [req.user.member_id, req.gym_id]
+        );
+      } catch (_) { /* best effort */ }
+    }
+
+    // Issue a new access token with the correct member_id so the client doesn't need to re-login
+    const newAccessToken = jwt.sign(
+      { id: req.user.id, gym_id: req.gym_id, role: 'member', member_id: member.id },
+      process.env.JWT_SECRET!,
+      { expiresIn: '1h' }
+    );
+
+    res.json({ success: true, data: {
+      message: `Account linked to member "${member.name}" successfully!`,
+      member_id: member.id,
+      access_token: newAccessToken,
+    }});
   } catch (error) { next(error); }
 });
 

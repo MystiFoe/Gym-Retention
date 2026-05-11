@@ -379,7 +379,11 @@ class ApiService {
       headers: _getHeaders(),
       body: jsonEncode({'phone': phone}),
     );
-    await _handleResponse(response, (data) => data);
+    final data = await _handleResponse(response, (d) => d as Map<String, dynamic>);
+    // Backend returns a new access token with the correct member_id — save it immediately
+    if (data['access_token'] != null) {
+      await _saveTokens(data['access_token'] as String, _refreshToken ?? '');
+    }
   }
 
   Future<List<Map<String, dynamic>>> getMyAttendance({required int year, required int month}) async {

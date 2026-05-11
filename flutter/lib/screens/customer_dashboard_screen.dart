@@ -924,6 +924,52 @@ class _ProfileTabState extends State<_ProfileTab> {
                       ),
                     ),
                   const SizedBox(height: 16),
+
+                  // Show Link Account when profile loaded but phone is missing (broken link)
+                  if (!_editing && (_profile?.phone == null || _profile!.phone.isEmpty)) ...[
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: Colors.orange.shade50,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: Colors.orange.shade200),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(children: [
+                            Icon(Icons.warning_amber_rounded, color: Colors.orange.shade700, size: 18),
+                            const SizedBox(width: 6),
+                            Text('Profile not fully linked', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.orange.shade800, fontSize: 13)),
+                          ]),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Your account is not linked to your gym membership. Enter your gym-registered phone number to fix this.',
+                            style: TextStyle(fontSize: 12, color: Colors.orange.shade700),
+                          ),
+                          const SizedBox(height: 10),
+                          SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton.icon(
+                              icon: _linking
+                                  ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                                  : const Icon(Icons.link, size: 18),
+                              label: const Text('Link My Account'),
+                              onPressed: _linking ? null : _showLinkAccountDialog,
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.orange.shade700,
+                                foregroundColor: Colors.white,
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                  ],
+
                   SizedBox(
                     width: double.infinity, height: 48,
                     child: OutlinedButton.icon(
