@@ -709,65 +709,100 @@ class _ProfileTabState extends State<_ProfileTab> {
     }
   }
 
-  Future<void> _verifyEmail() async {
+  Future<void> _verifyField(String type) async {
+    // Step 1: request OTP
     String? otpKey;
-    String? maskedEmail;
+    String? maskedDest;
     try {
-      final result = await ApiService().sendVerifyOtp(type: 'email');
-      otpKey = result['key'] as String?;
-      maskedEmail = result['masked'] as String?;
+      final result = await ApiService().sendVerifyOtp(type: type);
+      otpKey    = result['key']    as String?;
+      maskedDest = result['masked'] as String?;
     } catch (e) {
       if (mounted) AppUiHelper().showModernSnackBar(context, message: e.toString().replaceFirst('Exception: ', ''), isError: true);
       return;
     }
     if (!mounted || otpKey == null) return;
 
+    final isEmail = type == 'email';
     final codeCtrl = TextEditingController();
-    final confirmed = await showDialog<bool>(
+    bool verifying = false;
+
+    // Step 2: show OTP dialog
+    await showDialog<void>(
       context: context,
       barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Verify Email'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('A 6-digit code was sent to ${maskedEmail ?? 'your email'}.',
-                style: const TextStyle(fontSize: 13)),
-            const SizedBox(height: 16),
-            TextField(
-              controller: codeCtrl,
-              keyboardType: TextInputType.number,
-              autofocus: true,
-              maxLength: 6,
-              decoration: InputDecoration(
-                labelText: 'Verification Code',
-                prefixIcon: const Icon(Icons.lock_outline),
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlgState) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Row(children: [
+            Icon(isEmail ? Icons.mark_email_read_outlined : Icons.phone_android,
+                color: const Color(0xFF2196F3)),
+            const SizedBox(width: 10),
+            Text('Verify ${isEmail ? "Email" : "Phone"}'),
+          ]),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'A 6-digit code was sent to ${maskedDest ?? (isEmail ? "your email" : "your email address on file")}.',
+                style: const TextStyle(fontSize: 13),
               ),
+              if (!isEmail)
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(
+                    '(Sent via email since SMS is not configured)',
+                    style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                  ),
+                ),
+              const SizedBox(height: 18),
+              TextField(
+                controller: codeCtrl,
+                keyboardType: TextInputType.number,
+                autofocus: true,
+                maxLength: 6,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, letterSpacing: 10),
+                decoration: InputDecoration(
+                  labelText: 'Enter 6-digit code',
+                  counterText: '',
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            ElevatedButton(
+              onPressed: verifying ? null : () async {
+                setDlgState(() => verifying = true);
+                try {
+                  await ApiService().confirmVerifyOtp(key: otpKey!, code: codeCtrl.text.trim());
+                  if (ctx.mounted) Navigator.pop(ctx);
+                  if (mounted) {
+                    AppUiHelper().showModernSnackBar(context,
+                        message: '${isEmail ? "Email" : "Phone"} verified successfully!');
+                    _load();
+                  }
+                } catch (e) {
+                  setDlgState(() => verifying = false);
+                  if (mounted) AppUiHelper().showModernSnackBar(context,
+                      message: e.toString().replaceFirst('Exception: ', ''), isError: true);
+                }
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF2196F3), foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              ),
+              child: verifying
+                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                  : const Text('Confirm'),
             ),
           ],
         ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2196F3), foregroundColor: Colors.white),
-            child: const Text('Verify'),
-          ),
-        ],
       ),
     );
-    if (confirmed != true || !mounted) return;
-    try {
-      await ApiService().confirmVerifyOtp(key: otpKey, code: codeCtrl.text.trim());
-      if (mounted) {
-        AppUiHelper().showModernSnackBar(context, message: 'Email verified!');
-        _load();
-      }
-    } catch (e) {
-      if (mounted) AppUiHelper().showModernSnackBar(context, message: e.toString().replaceFirst('Exception: ', ''), isError: true);
-    }
   }
 
   Future<void> _showLinkAccountDialog() async {
@@ -915,52 +950,86 @@ class _ProfileTabState extends State<_ProfileTab> {
                   // Edit fields
                   TextField(
                     controller: _nameCtrl, enabled: _editing,
-                    decoration: InputDecoration(labelText: 'Full Name', prefixIcon: const Icon(Icons.person_outline),
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
+                    decoration: InputDecoration(
+                      labelText: 'Full Name',
+                      prefixIcon: const Icon(Icons.person_outline),
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                    ),
                   ),
                   const SizedBox(height: 16),
+
+                  // Phone field + verification row
                   TextField(
                     controller: _phoneCtrl, enabled: _editing,
                     keyboardType: TextInputType.phone,
                     decoration: InputDecoration(
                       labelText: 'Phone Number',
                       prefixIcon: const Icon(Icons.phone_outlined),
-                      suffixIcon: _profile?.phoneVerified == true
-                          ? const Tooltip(message: 'Phone verified', child: Icon(Icons.verified_user, color: Colors.green, size: 22))
-                          : (!_editing && (_profile?.phone.isNotEmpty ?? false)
-                              ? Tooltip(
-                                  message: 'Phone not verified',
-                                  child: TextButton(
-                                    onPressed: () => AppUiHelper().showModernSnackBar(context, message: 'Phone verification via SMS is coming soon.'),
-                                    style: TextButton.styleFrom(foregroundColor: Colors.red, padding: const EdgeInsets.symmetric(horizontal: 8)),
-                                    child: const Text('Verify', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                                  ),
-                                )
-                              : null),
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                     ),
                   ),
-                  const SizedBox(height: 16),
+                  if (!_editing && _profile != null) ...[
+                    const SizedBox(height: 6),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: [
+                        if (_profile!.phoneVerified) ...[
+                          const Icon(Icons.verified_user, color: Colors.green, size: 16),
+                          const SizedBox(width: 4),
+                          const Text('Verified', style: TextStyle(color: Colors.green, fontSize: 12, fontWeight: FontWeight.bold)),
+                        ] else if (_profile!.phone.isNotEmpty)
+                          ElevatedButton.icon(
+                            icon: const Icon(Icons.phone_android, size: 15),
+                            label: const Text('Verify Phone', style: TextStyle(fontSize: 13)),
+                            onPressed: () => _verifyField('phone'),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.red.shade600,
+                              foregroundColor: Colors.white,
+                              minimumSize: const Size(0, 34),
+                              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 0),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
+                  const SizedBox(height: 12),
+
+                  // Email field + verification row
                   TextField(
-                    controller: _emailCtrl, enabled: _editing, keyboardType: TextInputType.emailAddress,
+                    controller: _emailCtrl, enabled: _editing,
+                    keyboardType: TextInputType.emailAddress,
                     decoration: InputDecoration(
                       labelText: 'Email Address',
                       prefixIcon: const Icon(Icons.email_outlined),
-                      suffixIcon: _profile?.emailVerified == true
-                          ? const Tooltip(message: 'Email verified', child: Icon(Icons.verified_user, color: Colors.green, size: 22))
-                          : (!_editing && (_profile?.email.isNotEmpty ?? false)
-                              ? Tooltip(
-                                  message: 'Email not verified — tap to verify',
-                                  child: TextButton(
-                                    onPressed: _verifyEmail,
-                                    style: TextButton.styleFrom(foregroundColor: Colors.red, padding: const EdgeInsets.symmetric(horizontal: 8)),
-                                    child: const Text('Verify', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                                  ),
-                                )
-                              : null),
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                     ),
                   ),
+                  if (!_editing && _profile != null) ...[
+                    const SizedBox(height: 6),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: [
+                        if (_profile!.emailVerified) ...[
+                          const Icon(Icons.verified_user, color: Colors.green, size: 16),
+                          const SizedBox(width: 4),
+                          const Text('Verified', style: TextStyle(color: Colors.green, fontSize: 12, fontWeight: FontWeight.bold)),
+                        ] else if (_profile!.email.isNotEmpty)
+                          ElevatedButton.icon(
+                            icon: const Icon(Icons.mark_email_read_outlined, size: 15),
+                            label: const Text('Verify Email', style: TextStyle(fontSize: 13)),
+                            onPressed: () => _verifyField('email'),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.red.shade600,
+                              foregroundColor: Colors.white,
+                              minimumSize: const Size(0, 34),
+                              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 0),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
                   const SizedBox(height: 24),
                   if (_editing)
                     SizedBox(

@@ -3325,11 +3325,24 @@ app.post('/api/customer/send-verify-otp', authenticate, authorize(['member']), a
           <p style="color:#888;font-size:12px">This code expires in 10 minutes.</p>
         </div>`);
             const masked = target.replace(/^(.{2})(.*)(@.*)$/, (_, a, b, c) => a + '*'.repeat(Math.min(b.length, 4)) + c);
-            res.json({ success: true, data: { key, masked } });
+            res.json({ success: true, data: { key, masked, via: 'email' } });
         }
         else {
-            // Phone OTP via SMS not implemented — return key without sending
-            res.status(501).json({ success: false, error: 'Phone verification via SMS is not available. Please contact your gym.' });
+            // Phone OTP: send code to member's email address (SMS not configured)
+            const emailResult = await pool.query(`SELECT email FROM members WHERE id = (SELECT id FROM members WHERE gym_id = $1 AND is_deleted = false AND (phone = $2 OR RIGHT(phone,10) = RIGHT($2,10)) LIMIT 1)`, [req.gym_id, target]).catch(() => ({ rows: [] }));
+            const memberEmail = emailResult.rows[0]?.email || null;
+            if (!memberEmail)
+                return res.status(400).json({ success: false, error: 'No email address on file. Please add an email first to receive the OTP.' });
+            await sendEmail(memberEmail, 'Verify your phone number — Recurva', `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:32px;background:#f9f9f9;border-radius:12px">
+          <h2 style="color:#4CAF50">Verify Your Phone Number</h2>
+          <p style="color:#444">Enter this code in the app to verify your phone number <strong>${target}</strong>:</p>
+          <div style="background:#fff;border:2px solid #4CAF50;border-radius:10px;padding:20px;text-align:center;margin:24px 0">
+            <span style="font-size:42px;font-weight:bold;letter-spacing:14px;color:#1a1a1a;font-family:monospace">${otp}</span>
+          </div>
+          <p style="color:#888;font-size:12px">This code expires in 10 minutes.</p>
+        </div>`);
+            const maskedEmail = memberEmail.replace(/^(.{2})(.*)(@.*)$/, (_, a, b, c) => a + '*'.repeat(Math.min(b.length, 4)) + c);
+            res.json({ success: true, data: { key, masked: maskedEmail, via: 'email' } });
         }
     }
     catch (error) {
