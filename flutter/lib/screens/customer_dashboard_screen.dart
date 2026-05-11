@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
-import 'package:qr_flutter/qr_flutter.dart';
 import 'package:razorpay_flutter/razorpay_flutter.dart';
 import '../services/api_service.dart';
 import '../models/models.dart';
@@ -684,6 +683,7 @@ class _ProfileTabState extends State<_ProfileTab> {
   String? _error;
   final _nameCtrl  = TextEditingController();
   final _emailCtrl = TextEditingController();
+  final _phoneCtrl = TextEditingController();
 
   @override
   void initState() {
@@ -695,6 +695,7 @@ class _ProfileTabState extends State<_ProfileTab> {
   void dispose() {
     _nameCtrl.dispose();
     _emailCtrl.dispose();
+    _phoneCtrl.dispose();
     super.dispose();
   }
 
@@ -702,9 +703,70 @@ class _ProfileTabState extends State<_ProfileTab> {
     setState(() { _loading = true; _error = null; });
     try {
       final p = await ApiService().getCustomerProfile();
-      if (mounted) setState(() { _profile = p; _nameCtrl.text = p.name; _emailCtrl.text = p.email; _loading = false; });
+      if (mounted) setState(() { _profile = p; _nameCtrl.text = p.name; _emailCtrl.text = p.email; _phoneCtrl.text = p.phone; _loading = false; });
     } catch (e) {
       if (mounted) setState(() { _loading = false; _error = e.toString().replaceFirst('Exception: ', ''); });
+    }
+  }
+
+  Future<void> _verifyEmail() async {
+    String? otpKey;
+    String? maskedEmail;
+    try {
+      final result = await ApiService().sendVerifyOtp(type: 'email');
+      otpKey = result['key'] as String?;
+      maskedEmail = result['masked'] as String?;
+    } catch (e) {
+      if (mounted) AppUiHelper().showModernSnackBar(context, message: e.toString().replaceFirst('Exception: ', ''), isError: true);
+      return;
+    }
+    if (!mounted || otpKey == null) return;
+
+    final codeCtrl = TextEditingController();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Verify Email'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('A 6-digit code was sent to ${maskedEmail ?? 'your email'}.',
+                style: const TextStyle(fontSize: 13)),
+            const SizedBox(height: 16),
+            TextField(
+              controller: codeCtrl,
+              keyboardType: TextInputType.number,
+              autofocus: true,
+              maxLength: 6,
+              decoration: InputDecoration(
+                labelText: 'Verification Code',
+                prefixIcon: const Icon(Icons.lock_outline),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2196F3), foregroundColor: Colors.white),
+            child: const Text('Verify'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      await ApiService().confirmVerifyOtp(key: otpKey, code: codeCtrl.text.trim());
+      if (mounted) {
+        AppUiHelper().showModernSnackBar(context, message: 'Email verified!');
+        _load();
+      }
+    } catch (e) {
+      if (mounted) AppUiHelper().showModernSnackBar(context, message: e.toString().replaceFirst('Exception: ', ''), isError: true);
     }
   }
 
@@ -769,7 +831,11 @@ class _ProfileTabState extends State<_ProfileTab> {
   Future<void> _save() async {
     setState(() => _saving = true);
     try {
-      await ApiService().updateCustomerProfile(name: _nameCtrl.text.trim(), email: _emailCtrl.text.trim());
+      await ApiService().updateCustomerProfile(
+        name: _nameCtrl.text.trim(),
+        email: _emailCtrl.text.trim(),
+        phone: _phoneCtrl.text.trim(),
+      );
       if (mounted) {
         AppUiHelper().showModernSnackBar(context, message: 'Profile updated successfully');
         setState(() { _editing = false; _saving = false; });
@@ -796,7 +862,7 @@ class _ProfileTabState extends State<_ProfileTab> {
           if (_editing)
             IconButton(icon: const Icon(Icons.close), onPressed: () {
               setState(() { _editing = false; });
-              if (_profile != null) { _nameCtrl.text = _profile!.name; _emailCtrl.text = _profile!.email; }
+              if (_profile != null) { _nameCtrl.text = _profile!.name; _emailCtrl.text = _profile!.email; _phoneCtrl.text = _profile!.phone; }
             }),
         ],
       ),
@@ -846,38 +912,6 @@ class _ProfileTabState extends State<_ProfileTab> {
                 children: [
                   const SizedBox(height: 8),
 
-                  // QR code card
-                  if (_profile != null) ...[
-                    Card(
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                      elevation: 2,
-                      child: Padding(
-                        padding: const EdgeInsets.all(20),
-                        child: Column(
-                          children: [
-                            const Text('My Attendance QR',
-                                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                            const SizedBox(height: 4),
-                            Text('Show this to staff to mark attendance',
-                                style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
-                            const SizedBox(height: 16),
-                            QrImageView(
-                              data: 'recurva://member/${_profile!.id}',
-                              version: QrVersions.auto,
-                              size: 160,
-                              eyeStyle: const QrEyeStyle(eyeShape: QrEyeShape.square, color: Color(0xFF2196F3)),
-                              dataModuleStyle: const QrDataModuleStyle(dataModuleShape: QrDataModuleShape.square, color: Colors.black87),
-                            ),
-                            const SizedBox(height: 8),
-                            Text(_profile!.name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                            Text(_profile!.gymName, style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
-                          ],
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 20),
-                  ],
-
                   // Edit fields
                   TextField(
                     controller: _nameCtrl, enabled: _editing,
@@ -886,13 +920,23 @@ class _ProfileTabState extends State<_ProfileTab> {
                   ),
                   const SizedBox(height: 16),
                   TextField(
-                    controller: TextEditingController(text: _profile?.phone ?? ''), enabled: false,
+                    controller: _phoneCtrl, enabled: _editing,
+                    keyboardType: TextInputType.phone,
                     decoration: InputDecoration(
-                      labelText: 'Phone (login — cannot change)',
+                      labelText: 'Phone Number',
                       prefixIcon: const Icon(Icons.phone_outlined),
                       suffixIcon: _profile?.phoneVerified == true
-                          ? const Tooltip(message: 'Phone verified', child: Icon(Icons.verified, color: Colors.green, size: 20))
-                          : const Tooltip(message: 'Phone not verified', child: Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 20)),
+                          ? const Tooltip(message: 'Phone verified', child: Icon(Icons.verified_user, color: Colors.green, size: 22))
+                          : (!_editing && (_profile?.phone.isNotEmpty ?? false)
+                              ? Tooltip(
+                                  message: 'Phone not verified',
+                                  child: TextButton(
+                                    onPressed: () => AppUiHelper().showModernSnackBar(context, message: 'Phone verification via SMS is coming soon.'),
+                                    style: TextButton.styleFrom(foregroundColor: Colors.red, padding: const EdgeInsets.symmetric(horizontal: 8)),
+                                    child: const Text('Verify', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                                  ),
+                                )
+                              : null),
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                     ),
                   ),
@@ -903,8 +947,17 @@ class _ProfileTabState extends State<_ProfileTab> {
                       labelText: 'Email Address',
                       prefixIcon: const Icon(Icons.email_outlined),
                       suffixIcon: _profile?.emailVerified == true
-                          ? const Tooltip(message: 'Email verified', child: Icon(Icons.verified, color: Colors.green, size: 20))
-                          : const Tooltip(message: 'Email not verified', child: Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 20)),
+                          ? const Tooltip(message: 'Email verified', child: Icon(Icons.verified_user, color: Colors.green, size: 22))
+                          : (!_editing && (_profile?.email.isNotEmpty ?? false)
+                              ? Tooltip(
+                                  message: 'Email not verified — tap to verify',
+                                  child: TextButton(
+                                    onPressed: _verifyEmail,
+                                    style: TextButton.styleFrom(foregroundColor: Colors.red, padding: const EdgeInsets.symmetric(horizontal: 8)),
+                                    child: const Text('Verify', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                                  ),
+                                )
+                              : null),
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                     ),
                   ),

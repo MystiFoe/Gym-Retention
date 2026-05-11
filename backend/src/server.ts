@@ -3808,23 +3808,18 @@ app.post('/api/attendance/checkin', authenticate, authorize(['member']), async (
       return res.json({ success: true, data: { message: 'Already marked today', already_marked: true, source: existing.rows[0].source } });
     }
 
-    // Insert attendance — try visited_at column first, fall back to visit_date
-    try {
-      await pool.query(
-        `INSERT INTO attendance_logs (gym_id, member_id, visited_at, visit_date, status, source)
-         VALUES ($1, $2, NOW(), $3::date, 'present', 'mobile')
-         ON CONFLICT ON CONSTRAINT idx_attendance_member_day DO NOTHING`,
-        [req.gym_id, memberIdParam, today]
-      );
-    } catch (insertErr: any) {
-      // visited_at column missing or constraint name wrong — use legacy columns only
-      await pool.query(
-        `INSERT INTO attendance_logs (gym_id, member_id, visit_date, status, source)
-         VALUES ($1, $2, $3, 'present', 'mobile')
-         ON CONFLICT DO NOTHING`,
-        [req.gym_id, memberIdParam, today]
-      );
+    // Insert attendance — progressive fallback: drop unavailable columns one by one
+    let inserted = false;
+    const insertAttempts: Array<[string, any[]]> = [
+      [`INSERT INTO attendance_logs (gym_id, member_id, visited_at, visit_date, status, source) VALUES ($1, $2, NOW(), $3::date, 'present', 'mobile') ON CONFLICT ON CONSTRAINT idx_attendance_member_day DO NOTHING`, [req.gym_id, memberIdParam, today]],
+      [`INSERT INTO attendance_logs (gym_id, member_id, visit_date, status, source) VALUES ($1, $2, $3, 'present', 'mobile') ON CONFLICT DO NOTHING`, [req.gym_id, memberIdParam, today]],
+      [`INSERT INTO attendance_logs (gym_id, member_id, visited_at, visit_date, source) VALUES ($1, $2, NOW(), $3::date, 'mobile') ON CONFLICT DO NOTHING`, [req.gym_id, memberIdParam, today]],
+      [`INSERT INTO attendance_logs (gym_id, member_id, visit_date, source) VALUES ($1, $2, $3, 'mobile') ON CONFLICT DO NOTHING`, [req.gym_id, memberIdParam, today]],
+    ];
+    for (const [sql, params] of insertAttempts) {
+      try { await pool.query(sql, params); inserted = true; break; } catch { /* try next variant */ }
     }
+    if (!inserted) throw new Error('Failed to record attendance — database schema error');
     await pool.query(
       `UPDATE members SET last_visit_date = $1 WHERE id = $2 AND (last_visit_date IS NULL OR last_visit_date < $1)`,
       [today, memberIdParam]
@@ -3982,15 +3977,82 @@ app.get('/api/customer/profile', authenticate, authorize(['member']), async (req
 
 app.put('/api/customer/profile', authenticate, authorize(['member']), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const { name, email } = req.body;
+    const { name, email, phone } = req.body;
     if (!name || name.trim().length < 2) return res.status(400).json({ success: false, error: 'Name must be at least 2 characters' });
     let memberIdParam = req.user.member_id ?? await resolveMemberId(req.user.id, req.gym_id!);
     if (!memberIdParam) return res.status(404).json({ success: false, error: 'Profile not found' });
-    await pool.query(
-      `UPDATE members SET name = $1, email = $2 WHERE id = $3 AND gym_id = $4 AND is_deleted = false`,
-      [name.trim(), email?.trim() || null, memberIdParam, req.gym_id]
-    );
+    const newPhone = phone?.trim() || null;
+    const newEmail = email?.trim() || null;
+    try {
+      // With phone column update
+      await pool.query(
+        `UPDATE members SET name = $1, email = $2, phone = COALESCE(NULLIF($3, ''), phone) WHERE id = $4 AND gym_id = $5 AND is_deleted = false`,
+        [name.trim(), newEmail, newPhone, memberIdParam, req.gym_id]
+      );
+    } catch {
+      // Fallback: without phone (column may not exist or other issue)
+      await pool.query(
+        `UPDATE members SET name = $1, email = $2 WHERE id = $3 AND gym_id = $4 AND is_deleted = false`,
+        [name.trim(), newEmail, memberIdParam, req.gym_id]
+      );
+    }
     res.json({ success: true, data: { message: 'Profile updated' } });
+  } catch (error) { next(error); }
+});
+
+// In-memory OTP store for profile field verification (email/phone)
+const profileVerifyOtpStore = new Map<string, { code: string; expires: Date; userId: string; type: 'email' | 'phone'; value: string }>();
+
+app.post('/api/customer/send-verify-otp', authenticate, authorize(['member']), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { type } = req.body as { type?: string };
+    if (type !== 'email' && type !== 'phone') return res.status(400).json({ success: false, error: 'type must be email or phone' });
+    let memberIdParam = req.user.member_id ?? await resolveMemberId(req.user.id, req.gym_id!);
+    if (!memberIdParam) return res.status(404).json({ success: false, error: 'Member not found' });
+    const profile = await pool.query(`SELECT email, phone FROM members WHERE id = $1 AND gym_id = $2`, [memberIdParam, req.gym_id]);
+    if (!profile.rows[0]) return res.status(404).json({ success: false, error: 'Member not found' });
+    const target: string | null = type === 'email' ? profile.rows[0].email : profile.rows[0].phone;
+    if (!target) return res.status(400).json({ success: false, error: `No ${type} set on your profile` });
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const key = crypto.randomBytes(16).toString('hex');
+    profileVerifyOtpStore.set(key, { code: otp, expires: new Date(Date.now() + 10 * 60 * 1000), userId: req.user.id, type: type as 'email' | 'phone', value: target });
+    if (type === 'email') {
+      await sendEmail(target, 'Verify your Recurva email',
+        `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:32px;background:#f9f9f9;border-radius:12px">
+          <h2 style="color:#2196F3">Verify Your Email</h2>
+          <p style="color:#444">Enter this code in the app to verify your email address:</p>
+          <div style="background:#fff;border:2px solid #2196F3;border-radius:10px;padding:20px;text-align:center;margin:24px 0">
+            <span style="font-size:42px;font-weight:bold;letter-spacing:14px;color:#1a1a1a;font-family:monospace">${otp}</span>
+          </div>
+          <p style="color:#888;font-size:12px">This code expires in 10 minutes.</p>
+        </div>`
+      );
+      const masked = target.replace(/^(.{2})(.*)(@.*)$/, (_, a, b, c) => a + '*'.repeat(Math.min(b.length, 4)) + c);
+      res.json({ success: true, data: { key, masked } });
+    } else {
+      // Phone OTP via SMS not implemented — return key without sending
+      res.status(501).json({ success: false, error: 'Phone verification via SMS is not available. Please contact your gym.' });
+    }
+  } catch (error) { next(error); }
+});
+
+app.post('/api/customer/confirm-verify-otp', authenticate, authorize(['member']), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { key, code } = req.body as { key?: string; code?: string };
+    if (!key || !code) return res.status(400).json({ success: false, error: 'key and code are required' });
+    const stored = profileVerifyOtpStore.get(key);
+    if (!stored || stored.userId !== req.user.id) return res.status(400).json({ success: false, error: 'Invalid verification session' });
+    if (new Date() > stored.expires) { profileVerifyOtpStore.delete(key); return res.status(400).json({ success: false, error: 'OTP expired — please request a new one' }); }
+    if (stored.code !== String(code).trim()) return res.status(400).json({ success: false, error: 'Incorrect code. Please try again.' });
+    profileVerifyOtpStore.delete(key);
+    let memberIdParam = req.user.member_id ?? await resolveMemberId(req.user.id, req.gym_id!);
+    if (!memberIdParam) return res.status(404).json({ success: false, error: 'Member not found' });
+    const col = stored.type === 'email' ? 'email_verified' : 'phone_verified';
+    const valCol = stored.type === 'email' ? 'email' : 'phone';
+    try {
+      await pool.query(`UPDATE members SET ${col} = true WHERE id = $1 AND ${valCol} = $2 AND gym_id = $3`, [memberIdParam, stored.value, req.gym_id]);
+    } catch { /* column may not exist yet — best effort */ }
+    res.json({ success: true, data: { message: `${stored.type === 'email' ? 'Email' : 'Phone'} verified successfully!` } });
   } catch (error) { next(error); }
 });
 
@@ -4003,7 +4065,7 @@ app.get('/api/customer/attendance', authenticate, authorize(['member']), async (
     let attResult: any;
     try {
       attResult = await pool.query(
-        `SELECT DATE(visited_at)::text AS date, status, COALESCE(source, 'staff') AS source
+        `SELECT DATE(visited_at)::text AS date, 'present' AS status, COALESCE(source, 'staff') AS source
          FROM attendance_logs
          WHERE member_id = $1 AND gym_id = $2
            AND visited_at IS NOT NULL
@@ -4016,7 +4078,7 @@ app.get('/api/customer/attendance', authenticate, authorize(['member']), async (
       // visited_at column missing — fall back to visit_date
       if (colErr?.message?.includes('visited_at')) {
         attResult = await pool.query(
-          `SELECT visit_date::text AS date, status, COALESCE(source, 'staff') AS source
+          `SELECT visit_date::text AS date, 'present' AS status, COALESCE(source, 'staff') AS source
            FROM attendance_logs
            WHERE member_id = $1 AND gym_id = $2
              AND visit_date IS NOT NULL

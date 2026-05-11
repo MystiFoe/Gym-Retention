@@ -1,6 +1,7 @@
 ﻿// ignore: avoid_web_libraries_in_flutter
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:gym_fitness_app/utils/app_routes.dart';
 import 'package:gym_fitness_app/utils/app_utils.dart';
@@ -497,6 +498,147 @@ class _MembersScreenState extends State<MembersScreen> {
     }
   }
 
+  void _showMemberCreatedDialog(BuildContext context, Customer member) {
+    String? inviteCode;
+    bool generatingInvite = false;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: const Row(children: [
+            Icon(Icons.check_circle, color: Colors.green, size: 26),
+            SizedBox(width: 10),
+            Text('Member Added!'),
+          ]),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('${member.name} has been added successfully.',
+                    style: const TextStyle(fontSize: 14)),
+                if (member.displayId != null) ...[
+                  const SizedBox(height: 14),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFE3F2FD),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: const Color(0xFF90CAF9)),
+                    ),
+                    child: Row(
+                      children: [
+                        Expanded(child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text('Member ID', style: TextStyle(fontSize: 11, color: Colors.grey.shade600)),
+                            const SizedBox(height: 2),
+                            SelectableText(
+                              member.displayId!,
+                              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold,
+                                  letterSpacing: 1, color: Color(0xFF1565C0), fontFamily: 'monospace'),
+                            ),
+                          ],
+                        )),
+                        IconButton(
+                          icon: const Icon(Icons.copy, color: Color(0xFF2196F3)),
+                          tooltip: 'Copy ID',
+                          onPressed: () {
+                            Clipboard.setData(ClipboardData(text: member.displayId!));
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Member ID copied!'), duration: Duration(seconds: 2)),
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+                if (inviteCode != null) ...[
+                  const SizedBox(height: 16),
+                  const Text('Invite Code', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFE8F5E9),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: const Color(0xFF66BB6A)),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Expanded(
+                          child: SelectableText(
+                            inviteCode!,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold,
+                                letterSpacing: 6, color: Color(0xFF2E7D32), fontFamily: 'monospace'),
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.copy, color: Color(0xFF388E3C)),
+                          tooltip: 'Copy invite code',
+                          onPressed: () {
+                            Clipboard.setData(ClipboardData(text: inviteCode!));
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Invite code copied!'), duration: Duration(seconds: 2)),
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text('Valid for 7 days. Share with ${member.name} to register in the app.',
+                      style: TextStyle(fontSize: 11, color: Colors.grey.shade600)),
+                ],
+              ],
+            ),
+          ),
+          actions: [
+            if (inviteCode == null)
+              ElevatedButton.icon(
+                icon: generatingInvite
+                    ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                    : const Icon(Icons.link, size: 18),
+                label: const Text('Generate Invite Code'),
+                onPressed: generatingInvite ? null : () async {
+                  setDialogState(() => generatingInvite = true);
+                  try {
+                    final result = await ApiService().generateInvite(
+                      type: 'member',
+                      memberId: member.id,
+                      name: member.name,
+                      phone: member.phone,
+                    );
+                    setDialogState(() { inviteCode = result.code; generatingInvite = false; });
+                  } catch (e) {
+                    setDialogState(() => generatingInvite = false);
+                    if (ctx.mounted) {
+                      AppUiHelper().showModernSnackBar(context,
+                          message: e.toString().replaceFirst('Exception: ', ''), isError: true);
+                    }
+                  }
+                },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF2196F3),
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+              ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Done'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   void _confirmEraseData(BuildContext context, Customer member) {
     showDialog(
       context: context,
@@ -830,7 +972,7 @@ class _MembersScreenState extends State<MembersScreen> {
                 if (selectedTrainerId == null) return;
                 final nav = Navigator.of(ctx);
                 try {
-                  await ApiService().createCustomer(
+                  final newMember = await ApiService().createCustomer(
                     name: nameController.text.trim(),
                     phone: phoneController.text.trim(),
                     email: emailController.text.trim(),
@@ -842,7 +984,7 @@ class _MembersScreenState extends State<MembersScreen> {
                   if (!context.mounted) return;
                   nav.pop();
                   _loadMembers(refresh: true);
-                  AppUiHelper().showModernSnackBar(context, message: "Customer added successfully");
+                  _showMemberCreatedDialog(context, newMember);
                 } catch (e) {
                   if (!context.mounted) return;
                   AppUiHelper().showModernSnackBar(context, message: e.toString(), isError: true);

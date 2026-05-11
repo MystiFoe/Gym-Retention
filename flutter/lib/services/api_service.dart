@@ -362,12 +362,32 @@ class ApiService {
     return _handleResponse(response, (data) => CustomerProfile.fromJson(data));
   }
 
-  Future<void> updateCustomerProfile({required String name, required String email}) async {
+  Future<void> updateCustomerProfile({required String name, required String email, String? phone}) async {
     await loadTokens();
     final response = await http.put(
       Uri.parse('$baseUrl/customer/profile'),
       headers: _getHeaders(),
-      body: jsonEncode({'name': name, 'email': email}),
+      body: jsonEncode({'name': name, 'email': email, if (phone != null && phone.isNotEmpty) 'phone': phone}),
+    );
+    await _handleResponse(response, (data) => data);
+  }
+
+  Future<Map<String, dynamic>> sendVerifyOtp({required String type}) async {
+    await loadTokens();
+    final response = await http.post(
+      Uri.parse('$baseUrl/customer/send-verify-otp'),
+      headers: _getHeaders(),
+      body: jsonEncode({'type': type}),
+    );
+    return await _handleResponse(response, (data) => data as Map<String, dynamic>);
+  }
+
+  Future<void> confirmVerifyOtp({required String key, required String code}) async {
+    await loadTokens();
+    final response = await http.post(
+      Uri.parse('$baseUrl/customer/confirm-verify-otp'),
+      headers: _getHeaders(),
+      body: jsonEncode({'key': key, 'code': code}),
     );
     await _handleResponse(response, (data) => data);
   }
