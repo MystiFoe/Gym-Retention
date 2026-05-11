@@ -4841,7 +4841,7 @@ app.delete('/api/admin/gyms/:id', adminAuth, async (req: Request, res: Response)
 // POST /api/invites — owner/admin generates an invite code for a new staff or member
 app.post('/api/invites', authenticate, authorize(['owner']), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const { type, name, phone, trainer_role } = req.body;
+    const { type, name, phone, trainer_role, member_id: directMemberId } = req.body;
     if (!type || !['staff', 'member'].includes(type)) {
       return res.status(400).json({ success: false, error: 'type must be staff or member' });
     }
@@ -4867,6 +4867,38 @@ app.post('/api/invites', authenticate, authorize(['owner']), async (req: AuthReq
           [req.gym_id, name || '', displayId, role || 'staff']
         );
         trainerId = trainerRes.rows[0].id;
+      } else {
+        // For member invites: link to the actual member record.
+        // Priority 1: direct member_id passed by the client (most accurate).
+        if (directMemberId) {
+          const check = await client.query(
+            `SELECT id FROM members WHERE id = $1 AND gym_id = $2 AND is_deleted = false`,
+            [directMemberId, req.gym_id]
+          );
+          memberId = check.rows[0]?.id;
+        }
+        // Priority 2: find by phone number.
+        if (!memberId && phone) {
+          const byPhone = await client.query(
+            `SELECT id FROM members
+             WHERE gym_id = $1 AND is_deleted = false
+               AND (phone = $2 OR RIGHT(phone, 10) = RIGHT($2, 10))
+             LIMIT 1`,
+            [req.gym_id, phone.trim()]
+          );
+          memberId = byPhone.rows[0]?.id;
+        }
+        // Priority 3: fallback to exact name (risky but better than nothing).
+        if (!memberId && name) {
+          const byName = await client.query(
+            `SELECT id FROM members
+             WHERE gym_id = $1 AND is_deleted = false
+               AND LOWER(TRIM(name)) = LOWER(TRIM($2))
+             LIMIT 1`,
+            [req.gym_id, name]
+          );
+          memberId = byName.rows[0]?.id;
+        }
       }
 
       await client.query(
@@ -5138,20 +5170,36 @@ app.post('/api/auth/member/register', async (req: Request, res: Response, next: 
       let linkedMemberId: string | null = invite.member_id || null;
 
       if (!linkedMemberId) {
-        // Try to find an existing unlinked member in this gym matching by phone or email
+        // Generic invite — search for the existing member record using every available signal:
+        //   1. Phone the member typed at registration
+        //   2. placeholder_phone stored on the invite (what the gym owner used when adding the member)
+        //   3. placeholder_name stored on the invite
+        //   4. Email the member typed at registration
+        const regPhone      = phone ? phone.trim() : null;
+        const invitePhone   = invite.placeholder_phone ? invite.placeholder_phone.trim() : null;
+        const inviteName    = invite.placeholder_name  ? invite.placeholder_name.trim()  : null;
         try {
           const existing = await client.query(
             `SELECT id FROM members
-             WHERE gym_id = $1 AND is_deleted = false
-               AND (LOWER(email) = LOWER($2) OR phone = $3 OR RIGHT(phone, 10) = RIGHT($3, 10))
+             WHERE gym_id = $1 AND is_deleted = false AND (
+               ($2 IS NOT NULL AND (phone = $2 OR RIGHT(phone, 10) = RIGHT($2, 10)))
+               OR ($3 IS NOT NULL AND (phone = $3 OR RIGHT(phone, 10) = RIGHT($3, 10)))
+               OR LOWER(email) = LOWER($4)
+               OR ($5 IS NOT NULL AND LOWER(TRIM(name)) = LOWER($5))
+             )
+             ORDER BY
+               CASE WHEN $2 IS NOT NULL AND (phone = $2 OR RIGHT(phone, 10) = RIGHT($2, 10)) THEN 0
+                    WHEN $3 IS NOT NULL AND (phone = $3 OR RIGHT(phone, 10) = RIGHT($3, 10)) THEN 1
+                    WHEN LOWER(email) = LOWER($4) THEN 2
+                    ELSE 3 END
              LIMIT 1`,
-            [invite.gym_id, email, phone]
+            [invite.gym_id, regPhone, invitePhone, email, inviteName]
           );
           linkedMemberId = existing.rows[0]?.id || null;
         } catch { /* ignore — will create new record below */ }
 
         if (!linkedMemberId) {
-          // No existing member found — create a new placeholder record
+          // No existing member found — create a new record
           try {
             const newMember = await client.query(
               `INSERT INTO members (gym_id, name, phone, email, user_id, membership_expiry_date, plan_fee, plan, status)
@@ -5160,7 +5208,7 @@ app.post('/api/auth/member/register', async (req: Request, res: Response, next: 
             );
             linkedMemberId = newMember.rows[0]?.id || null;
           } catch {
-            // If user_id column doesn't exist yet, insert without it
+            // user_id column doesn't exist yet — insert without it
             try {
               const newMember = await client.query(
                 `INSERT INTO members (gym_id, name, phone, email, membership_expiry_date, plan_fee, plan, status)

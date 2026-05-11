@@ -270,11 +270,18 @@ class _MembersScreenState extends State<MembersScreen> {
                   ),
                   PopupMenuButton<String>(
                     onSelected: (value) {
-                      if (value == 'edit') _showEditMemberDialog(context, member);
+                      if (value == 'edit')   _showEditMemberDialog(context, member);
                       if (value == 'delete') _confirmDelete(context, member);
-                      if (value == 'erase') _confirmEraseData(context, member);
+                      if (value == 'erase')  _confirmEraseData(context, member);
+                      if (value == 'invite') _generateInvite(context, member);
                     },
                     itemBuilder: (_) => const [
+                      PopupMenuItem(value: 'invite', child: Row(children: [
+                        Icon(Icons.link, size: 16, color: Colors.blue),
+                        SizedBox(width: 8),
+                        Text('Generate Invite', style: TextStyle(color: Colors.blue)),
+                      ])),
+                      PopupMenuDivider(),
                       PopupMenuItem(value: 'edit', child: Text('Edit')),
                       PopupMenuItem(value: 'delete', child: Text('Delete', style: TextStyle(color: Colors.red))),
                       PopupMenuDivider(),
@@ -411,6 +418,84 @@ class _MembersScreenState extends State<MembersScreen> {
     }
   }
 
+
+  Future<void> _generateInvite(BuildContext context, Customer member) async {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const AlertDialog(
+        content: Row(children: [
+          CircularProgressIndicator(),
+          SizedBox(width: 16),
+          Text('Generating invite code...'),
+        ]),
+      ),
+    );
+
+    try {
+      final result = await ApiService().generateInvite(
+        type: 'member',
+        memberId: member.id,
+        name: member.name,
+        phone: member.phone,
+      );
+      if (!context.mounted) return;
+      Navigator.pop(context); // close progress dialog
+
+      final code = result.code;
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Invite Code Generated'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('Share this code with ${member.name}:',
+                  style: const TextStyle(fontSize: 13)),
+              const SizedBox(height: 16),
+              Container(
+                padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 24),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE3F2FD),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: const Color(0xFF2196F3)),
+                ),
+                child: SelectableText(
+                  code,
+                  style: const TextStyle(
+                    fontSize: 28, fontWeight: FontWeight.bold,
+                    letterSpacing: 4, color: Color(0xFF1565C0),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                'Valid for 7 days. Member uses this code to register in the app.',
+                style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                textAlign: TextAlign.center,
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+              },
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      Navigator.pop(context);
+      AppUiHelper().showModernSnackBar(
+        context,
+        message: e.toString().replaceFirst('Exception: ', ''),
+        isError: true,
+      );
+    }
+  }
 
   void _confirmEraseData(BuildContext context, Customer member) {
     showDialog(

@@ -954,15 +954,18 @@ class ApiService {
     required String type, // 'staff' | 'member'
     String? name,
     String? phone,
+    String? memberId,
     String trainerRole = 'staff',
   }) async {
+    await loadTokens();
     final response = await http.post(
       Uri.parse('$baseUrl/invites'),
       headers: _getHeaders(),
       body: jsonEncode({
         'type': type,
-        'name': name,
-        'phone': phone,
+        if (name != null) 'name': name,
+        if (phone != null) 'phone': phone,
+        if (memberId != null) 'member_id': memberId,
         if (type == 'staff') 'trainer_role': trainerRole,
       }),
     );
