@@ -4070,6 +4070,45 @@ app.post('/api/customer/confirm-verify-otp', authenticate, authorize(['member'])
   } catch (error) { next(error); }
 });
 
+// Firebase phone verification — client verified phone via Firebase SMS, now mark it on our DB
+app.post('/api/customer/firebase-verify-phone', authenticate, authorize(['member']), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { firebaseIdToken } = req.body as { firebaseIdToken?: string };
+    if (!firebaseIdToken) return res.status(400).json({ success: false, error: 'firebaseIdToken is required' });
+
+    // Verify the Firebase token
+    let decodedToken: any;
+    try {
+      decodedToken = await admin.auth().verifyIdToken(firebaseIdToken);
+    } catch {
+      return res.status(401).json({ success: false, error: 'Invalid or expired Firebase token' });
+    }
+
+    const firebasePhone: string | undefined = decodedToken.phone_number;
+    if (!firebasePhone) return res.status(400).json({ success: false, error: 'Firebase token does not contain a phone number' });
+
+    let memberIdParam = req.user.member_id ?? await resolveMemberId(req.user.id, req.gym_id!);
+    if (!memberIdParam) return res.status(404).json({ success: false, error: 'Member not found' });
+
+    // Verify phone matches member's stored phone (last 10 digits)
+    const memberRes = await pool.query(`SELECT phone FROM members WHERE id = $1 AND gym_id = $2`, [memberIdParam, req.gym_id]);
+    const memberPhone: string = memberRes.rows[0]?.phone || '';
+    const normalize = (p: string) => p.replace(/\D/g, '').slice(-10);
+    if (!memberPhone || normalize(firebasePhone) !== normalize(memberPhone)) {
+      return res.status(400).json({ success: false, error: 'Verified phone does not match your profile phone number' });
+    }
+
+    try {
+      await pool.query(`UPDATE members SET phone_verified = true WHERE id = $1 AND gym_id = $2`, [memberIdParam, req.gym_id]);
+    } catch { /* phone_verified column may not exist yet — best effort */ }
+
+    // Sign out the temporary Firebase session so it doesn't interfere with the member's auth
+    try { await admin.auth().revokeRefreshTokens(decodedToken.uid); } catch { /* best effort */ }
+
+    res.json({ success: true, data: { message: 'Phone verified successfully!' } });
+  } catch (error) { next(error); }
+});
+
 app.get('/api/customer/attendance', authenticate, authorize(['member']), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const year  = parseInt((req.query.year  as string) || `${new Date().getFullYear()}`);

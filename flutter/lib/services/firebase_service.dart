@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 
 /// Result returned by [FirebaseService.sendOtp].
 ///
@@ -20,18 +21,27 @@ class FirebaseService {
 
   final FirebaseAuth _auth = FirebaseAuth.instance;
 
+  // Web-only: holds the confirmation result from signInWithPhoneNumber
+  ConfirmationResult? _webConfirmationResult;
+
   // ── Step 1: send OTP ────────────────────────────────────────────────────
 
   /// Triggers Firebase to send an SMS OTP to [phoneNumber].
-  ///
   /// [phoneNumber] must include the country code, e.g. "+919876543210".
   ///
-  /// Returns an [OtpSendResult]:
-  ///   - If Android auto-verifies → result.idToken is ready, skip code entry.
-  ///   - Otherwise             → result.verificationId, ask user for code.
+  /// On web  → uses signInWithPhoneNumber + invisible reCAPTCHA.
+  /// On mobile → uses verifyPhoneNumber (Android auto-retrieval supported).
   ///
   /// Throws [FirebaseAuthException] on failure.
   Future<OtpSendResult> sendOtp(String phoneNumber) async {
+    if (kIsWeb) {
+      // Web path: pass no RecaptchaVerifier — Firebase creates an invisible one
+      // automatically (auth._delegate is set internally). Container=null → invisible.
+      _webConfirmationResult = await _auth.signInWithPhoneNumber(phoneNumber);
+      return OtpSendResult(verificationId: 'web');
+    }
+
+    // Mobile path
     final completer = Completer<OtpSendResult>();
 
     await _auth.verifyPhoneNumber(
@@ -62,8 +72,6 @@ class FirebaseService {
       },
 
       codeAutoRetrievalTimeout: (String verificationId) {
-        // Timeout reached without auto-resolve.
-        // Only complete if we haven't already completed via codeSent.
         if (!completer.isCompleted) {
           completer.complete(OtpSendResult(verificationId: verificationId));
         }
@@ -75,21 +83,29 @@ class FirebaseService {
 
   // ── Step 2: verify OTP code ─────────────────────────────────────────────
 
-  /// Signs in with the [smsCode] the user typed and the [verificationId]
-  /// returned by [sendOtp].
-  ///
-  /// Returns the Firebase ID token (a JWT) to pass to your backend.
+  /// Confirms the [smsCode] entered by the user.
+  /// Returns the Firebase ID token to pass to the backend for server-side
+  /// verification.
   ///
   /// Throws [FirebaseAuthException] if the code is wrong / expired.
   Future<String> verifyOtp({
     required String verificationId,
     required String smsCode,
   }) async {
-    final credential = PhoneAuthProvider.credential(
-      verificationId: verificationId,
-      smsCode: smsCode,
-    );
-    final userCred = await _auth.signInWithCredential(credential);
+    UserCredential userCred;
+
+    if (kIsWeb) {
+      if (_webConfirmationResult == null) throw Exception('No active OTP session. Please request a new code.');
+      userCred = await _webConfirmationResult!.confirm(smsCode);
+      _webConfirmationResult = null;
+    } else {
+      final credential = PhoneAuthProvider.credential(
+        verificationId: verificationId,
+        smsCode: smsCode,
+      );
+      userCred = await _auth.signInWithCredential(credential);
+    }
+
     final token = await userCred.user?.getIdToken();
     if (token == null) throw Exception('Failed to get Firebase ID token');
     return token;

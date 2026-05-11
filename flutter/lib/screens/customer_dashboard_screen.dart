@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:razorpay_flutter/razorpay_flutter.dart';
 import '../services/api_service.dart';
+import '../services/firebase_service.dart';
 import '../models/models.dart';
 import '../utils/appui_helper.dart';
 
@@ -92,21 +94,22 @@ class _AttendanceTabState extends State<_AttendanceTab> {
   void initState() {
     super.initState();
     _load();
-    _checkTodayStatus();
   }
 
   Future<void> _load() async {
     setState(() { _loading = true; _error = null; });
     try {
       final data = await ApiService().getMyAttendance(year: _month.year, month: _month.month);
-      if (mounted) setState(() { _records = data; _loading = false; });
+      if (mounted) {
+        setState(() { _records = data; _loading = false; });
+        _checkTodayStatus(); // always runs after records are populated
+      }
     } catch (e) {
       if (mounted) setState(() { _loading = false; _error = e.toString().replaceFirst('Exception: ', ''); });
     }
   }
 
-  Future<void> _checkTodayStatus() async {
-    // Check if today is in current month's records
+  void _checkTodayStatus() {
     final now = DateTime.now();
     if (_month.year != now.year || _month.month != now.month) return;
     final today = '${now.year}-${now.month.toString().padLeft(2,'0')}-${now.day.toString().padLeft(2,'0')}';
@@ -142,7 +145,7 @@ class _AttendanceTabState extends State<_AttendanceTab> {
 
   void _changeMonth(int delta) {
     setState(() => _month = DateTime(_month.year, _month.month + delta));
-    _load().then((_) => _checkTodayStatus());
+    _load();
   }
 
   @override
@@ -710,12 +713,118 @@ class _ProfileTabState extends State<_ProfileTab> {
   }
 
   Future<void> _verifyField(String type) async {
-    // Step 1: request OTP
+    if (type == 'phone') {
+      await _verifyPhoneViaFirebase();
+    } else {
+      await _verifyEmailViaOtp();
+    }
+  }
+
+  // Phone verification: Firebase sends real SMS → user enters code → backend confirms
+  Future<void> _verifyPhoneViaFirebase() async {
+    final rawPhone = _profile?.phone ?? '';
+    if (rawPhone.isEmpty) return;
+    final e164 = rawPhone.startsWith('+') ? rawPhone : '+91$rawPhone';
+
+    // Step 1: send SMS via Firebase
+    OtpSendResult sendResult;
+    try {
+      sendResult = await FirebaseService().sendOtp(e164);
+    } on FirebaseAuthException catch (e) {
+      if (mounted) AppUiHelper().showModernSnackBar(context, message: _friendlyFirebaseError(e), isError: true);
+      return;
+    } catch (e) {
+      if (mounted) AppUiHelper().showModernSnackBar(context, message: e.toString().replaceFirst('Exception: ', ''), isError: true);
+      return;
+    }
+    if (!mounted) return;
+
+    // Auto-verified (Android) — skip dialog
+    if (sendResult.autoVerified && sendResult.idToken != null) {
+      try {
+        await ApiService().firebaseVerifyPhone(firebaseIdToken: sendResult.idToken!);
+        if (mounted) { AppUiHelper().showModernSnackBar(context, message: 'Phone verified!'); _load(); }
+      } catch (e) {
+        if (mounted) AppUiHelper().showModernSnackBar(context, message: e.toString().replaceFirst('Exception: ', ''), isError: true);
+      }
+      return;
+    }
+
+    // Step 2: show OTP dialog for manual code entry
+    final codeCtrl = TextEditingController();
+    bool verifying = false;
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlgState) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: const Row(children: [
+            Icon(Icons.phone_android, color: Color(0xFF2196F3)),
+            SizedBox(width: 10),
+            Text('Verify Phone'),
+          ]),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('A 6-digit SMS code was sent to $e164.', style: const TextStyle(fontSize: 13)),
+              const SizedBox(height: 18),
+              TextField(
+                controller: codeCtrl,
+                keyboardType: TextInputType.number,
+                autofocus: true,
+                maxLength: 6,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, letterSpacing: 10),
+                decoration: InputDecoration(
+                  labelText: 'Enter 6-digit code',
+                  counterText: '',
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            ElevatedButton(
+              onPressed: verifying ? null : () async {
+                setDlgState(() => verifying = true);
+                try {
+                  final idToken = await FirebaseService().verifyOtp(
+                    verificationId: sendResult.verificationId!,
+                    smsCode: codeCtrl.text.trim(),
+                  );
+                  await ApiService().firebaseVerifyPhone(firebaseIdToken: idToken);
+                  if (ctx.mounted) Navigator.pop(ctx);
+                  if (mounted) { AppUiHelper().showModernSnackBar(context, message: 'Phone verified!'); _load(); }
+                } on FirebaseAuthException catch (e) {
+                  setDlgState(() => verifying = false);
+                  if (mounted) AppUiHelper().showModernSnackBar(context, message: _friendlyFirebaseError(e), isError: true);
+                } catch (e) {
+                  setDlgState(() => verifying = false);
+                  if (mounted) AppUiHelper().showModernSnackBar(context, message: e.toString().replaceFirst('Exception: ', ''), isError: true);
+                }
+              },
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2196F3), foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+              child: verifying
+                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                  : const Text('Confirm'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Email verification: backend sends OTP to email → user enters code → backend confirms
+  Future<void> _verifyEmailViaOtp() async {
     String? otpKey;
     String? maskedDest;
     try {
-      final result = await ApiService().sendVerifyOtp(type: type);
-      otpKey    = result['key']    as String?;
+      final result = await ApiService().sendVerifyOtp(type: 'email');
+      otpKey     = result['key']    as String?;
       maskedDest = result['masked'] as String?;
     } catch (e) {
       if (mounted) AppUiHelper().showModernSnackBar(context, message: e.toString().replaceFirst('Exception: ', ''), isError: true);
@@ -723,39 +832,24 @@ class _ProfileTabState extends State<_ProfileTab> {
     }
     if (!mounted || otpKey == null) return;
 
-    final isEmail = type == 'email';
     final codeCtrl = TextEditingController();
     bool verifying = false;
-
-    // Step 2: show OTP dialog
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDlgState) => AlertDialog(
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          title: Row(children: [
-            Icon(isEmail ? Icons.mark_email_read_outlined : Icons.phone_android,
-                color: const Color(0xFF2196F3)),
-            const SizedBox(width: 10),
-            Text('Verify ${isEmail ? "Email" : "Phone"}'),
+          title: const Row(children: [
+            Icon(Icons.mark_email_read_outlined, color: Color(0xFF2196F3)),
+            SizedBox(width: 10),
+            Text('Verify Email'),
           ]),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(
-                'A 6-digit code was sent to ${maskedDest ?? (isEmail ? "your email" : "your email address on file")}.',
-                style: const TextStyle(fontSize: 13),
-              ),
-              if (!isEmail)
-                Padding(
-                  padding: const EdgeInsets.only(top: 6),
-                  child: Text(
-                    '(Sent via email since SMS is not configured)',
-                    style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
-                  ),
-                ),
+              Text('A 6-digit code was sent to ${maskedDest ?? "your email"}.', style: const TextStyle(fontSize: 13)),
               const SizedBox(height: 18),
               TextField(
                 controller: codeCtrl,
@@ -780,21 +874,14 @@ class _ProfileTabState extends State<_ProfileTab> {
                 try {
                   await ApiService().confirmVerifyOtp(key: otpKey!, code: codeCtrl.text.trim());
                   if (ctx.mounted) Navigator.pop(ctx);
-                  if (mounted) {
-                    AppUiHelper().showModernSnackBar(context,
-                        message: '${isEmail ? "Email" : "Phone"} verified successfully!');
-                    _load();
-                  }
+                  if (mounted) { AppUiHelper().showModernSnackBar(context, message: 'Email verified!'); _load(); }
                 } catch (e) {
                   setDlgState(() => verifying = false);
-                  if (mounted) AppUiHelper().showModernSnackBar(context,
-                      message: e.toString().replaceFirst('Exception: ', ''), isError: true);
+                  if (mounted) AppUiHelper().showModernSnackBar(context, message: e.toString().replaceFirst('Exception: ', ''), isError: true);
                 }
               },
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF2196F3), foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-              ),
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2196F3), foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
               child: verifying
                   ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
                   : const Text('Confirm'),
@@ -803,6 +890,18 @@ class _ProfileTabState extends State<_ProfileTab> {
         ),
       ),
     );
+  }
+
+  String _friendlyFirebaseError(FirebaseAuthException e) {
+    switch (e.code) {
+      case 'invalid-phone-number':       return 'Invalid phone number. Please check and try again.';
+      case 'too-many-requests':          return 'Too many attempts. Please try again later.';
+      case 'invalid-verification-code':  return 'Wrong code. Please check and try again.';
+      case 'session-expired':            return 'Code expired. Please tap Verify Phone again.';
+      case 'quota-exceeded':             return 'SMS quota exceeded. Try again later.';
+      case 'network-request-failed':     return 'Network error. Check your internet connection.';
+      default: return e.message ?? 'Verification failed. Please try again.';
+    }
   }
 
   Future<void> _showLinkAccountDialog() async {

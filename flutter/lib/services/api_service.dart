@@ -392,6 +392,16 @@ class ApiService {
     await _handleResponse(response, (data) => data);
   }
 
+  Future<void> firebaseVerifyPhone({required String firebaseIdToken}) async {
+    await loadTokens();
+    final response = await http.post(
+      Uri.parse('$baseUrl/customer/firebase-verify-phone'),
+      headers: _getHeaders(),
+      body: jsonEncode({'firebaseIdToken': firebaseIdToken}),
+    );
+    await _handleResponse(response, (data) => data);
+  }
+
   Future<void> linkMemberAccount({required String phone}) async {
     await loadTokens();
     final response = await http.post(
